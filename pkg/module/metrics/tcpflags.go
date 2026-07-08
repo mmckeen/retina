@@ -102,7 +102,7 @@ func (t *TCPMetrics) ProcessFlow(flow *v1.Flow) {
 	}
 
 	flags := t.getFlagValues(tcp.GetFlags())
-	if len(flags) == 0 {
+	if len(flags) == 0 && len(utils.PreviouslyObservedTCPFlags(flow)) == 0 {
 		return
 	}
 

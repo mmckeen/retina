@@ -233,6 +233,7 @@ static void parse(struct __sk_buff *skb, __u8 obs)
 	// Process the packet in ct
 	struct packetreport report __attribute__((unused));
 	report = ct_process_packet(&p, obs, sampled);
+	p.report_reason = report.report_reason;
 
 	// If the data aggregation level is low, always send the packet to the perf buffer.
 	#if DATA_AGGREGATION_LEVEL == DATA_AGGREGATION_LEVEL_LOW
@@ -255,6 +256,27 @@ static void parse(struct __sk_buff *skb, __u8 obs)
 			bpf_ringbuf_output(&retina_packetparser_events, &p, sizeof(p), 0);
 #else
 			bpf_perf_event_output(skb, &retina_packetparser_events, BPF_F_CURRENT_CPU, &p, sizeof(p));
+#endif
+		}
+		// On terminal close the entry is deleted in-kernel, so flush the opposite direction's
+		// unreported bytes as a separate reversed flow (no current packet: bytes/flags zeroed).
+		if (report.flush_reverse) {
+			struct packet rp = p;
+			rp.src_ip = p.dst_ip;
+			rp.dst_ip = p.src_ip;
+			rp.src_port = p.dst_port;
+			rp.dst_port = p.src_port;
+			rp.is_reply = !p.is_reply;
+			rp.observation_point = p.observation_point ^ 1;
+			rp.flags = 0;
+			rp.bytes = 0;
+			rp.previously_observed_packets = report.reverse_previously_observed_packets;
+			rp.previously_observed_bytes = report.reverse_previously_observed_bytes;
+			rp.previously_observed_flags = report.reverse_previously_observed_flags;
+#ifdef USE_RING_BUFFER
+			bpf_ringbuf_output(&retina_packetparser_events, &rp, sizeof(rp), 0);
+#else
+			bpf_perf_event_output(skb, &retina_packetparser_events, BPF_F_CURRENT_CPU, &rp, sizeof(rp));
 #endif
 		}
 	#endif

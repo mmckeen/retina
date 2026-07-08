@@ -11,9 +11,11 @@ import (
 	"runtime"
 	"time"
 
+	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/microsoft/retina/internal/ktime"
+	"github.com/microsoft/retina/pkg/enricher"
 	"github.com/microsoft/retina/pkg/loader"
 	"github.com/microsoft/retina/pkg/log"
 	"github.com/microsoft/retina/pkg/metrics"
@@ -124,6 +126,8 @@ func (ct *Conntrack) Run(ctx context.Context) error {
 			var noOfCtEntries, entriesDeleted int
 			// List of keys to be deleted
 			var keysToDelete []conntrackCtV4Key
+			// Connections with unreported bytes, flushed as reap flows (paced) after iteration.
+			var reapItems []reapItem
 
 			// metrics counters
 			var packetsCountTx, packetsCountRx, totConnections uint32
@@ -138,6 +142,12 @@ func (ct *Conntrack) Run(ctx context.Context) error {
 					// So, we store the keys to be deleted in a list and delete them after the iteration.
 					keyCopy := key // Copy the key to avoid using the same key in the next iteration
 					keysToDelete = append(keysToDelete, keyCopy)
+					// Collect connections with unreported bytes; flushed as reap flows after
+					// iteration so short-lived/idle connections aren't lost when reaped here.
+					// The composite literal snapshots key/value by value (no explicit copy needed).
+					if value.BytesSeenSinceLastReportTxDir > 0 || value.BytesSeenSinceLastReportRxDir > 0 {
+						reapItems = append(reapItems, reapItem{key: key, value: value})
+					}
 				}
 				// Log the conntrack entry
 				srcIP := utils.Int2ip(key.SrcIp).To4()
@@ -193,7 +203,129 @@ func (ct *Conntrack) Run(ctx context.Context) error {
 					entriesDeleted++
 				}
 			}
+
+			// Flush reap flows spread across the GC interval so a pass trickles into
+			// the enricher ring instead of bursting it.
+			ct.emitReapFlows(reapItems)
 			ct.l.Debug("conntrack GC completed", zap.Int("number_of_entries", noOfCtEntries), zap.Int("entries_deleted", entriesDeleted))
 		}
+	}
+}
+
+// reapItem is a by-value snapshot of a conntrack entry to flush as a reap flow.
+type reapItem struct {
+	key   conntrackCtV4Key
+	value conntrackCtEntry
+}
+
+const (
+	reapEmitBatchSize        = 256
+	reapEmitIntervalFraction = 80 // percent of the GC interval to spread reap emits across
+)
+
+// emitReapFlows flushes reap flows evenly across most of the GC interval so a GC
+// pass trickles into the enricher ring instead of bursting it. Emission is paced
+// per batch to finish within reapEmitIntervalFraction of the interval, leaving
+// headroom before the next tick.
+func (ct *Conntrack) emitReapFlows(items []reapItem) {
+	if len(items) == 0 {
+		return
+	}
+	batches := (len(items) + reapEmitBatchSize - 1) / reapEmitBatchSize
+	pause := (ct.gcFrequency * reapEmitIntervalFraction / 100) / time.Duration(batches)
+	for i := range items {
+		ct.emitReapFlow(items[i].key, items[i].value)
+		if (i+1)%reapEmitBatchSize == 0 {
+			time.Sleep(pause)
+		}
+	}
+}
+
+// emitReapFlow flushes bytes/packets/flags observed since the last report for a
+// connection being reaped, one flow per direction with unreported data.
+func (ct *Conntrack) emitReapFlow(key conntrackCtV4Key, value conntrackCtEntry) {
+	e := enricher.Instance()
+	if e == nil {
+		return
+	}
+	reason := reapReason(key.Proto, &value)
+	if value.BytesSeenSinceLastReportTxDir > 0 {
+		f := value.FlagsSeenSinceLastReportTxDir
+		ct.writeReapFlow(e, &key, &value, false, value.BytesSeenSinceLastReportTxDir, value.PacketsSeenSinceLastReportTxDir,
+			utils.TCPFlagCounts{Syn: f.Syn, Ack: f.Ack, Fin: f.Fin, Rst: f.Rst, Psh: f.Psh, Urg: f.Urg, Ece: f.Ece, Cwr: f.Cwr, Ns: f.Ns}, reason)
+	}
+	if value.BytesSeenSinceLastReportRxDir > 0 {
+		f := value.FlagsSeenSinceLastReportRxDir
+		ct.writeReapFlow(e, &key, &value, true, value.BytesSeenSinceLastReportRxDir, value.PacketsSeenSinceLastReportRxDir,
+			utils.TCPFlagCounts{Syn: f.Syn, Ack: f.Ack, Fin: f.Fin, Rst: f.Rst, Psh: f.Psh, Urg: f.Urg, Ece: f.Ece, Cwr: f.Cwr, Ns: f.Ns}, reason)
+	}
+}
+
+// reapReason classifies why a conntrack entry reached GC reaping, from its proto
+// and the flags seen across both directions.
+func reapReason(proto uint8, value *conntrackCtEntry) string {
+	switch proto {
+	case protoUDP:
+		return reapReasonUDPIdle
+	case protoTCP:
+		flags := value.FlagsSeenTxDir | value.FlagsSeenRxDir
+		switch {
+		case flags&TCP_RST != 0:
+			return reapReasonTCPRst
+		case flags&TCP_FIN != 0:
+			return reapReasonTCPFin
+		default:
+			return reapReasonTCPIdle
+		}
+	default:
+		return reapReasonOther
+	}
+}
+
+const (
+	reapReasonUDPIdle = "udp_idle"
+	reapReasonTCPRst  = "tcp_rst"
+	reapReasonTCPFin  = "tcp_fin"
+	reapReasonTCPIdle = "tcp_idle"
+	reapReasonOther   = "other"
+)
+
+func (ct *Conntrack) writeReapFlow(e *enricher.Enricher, key *conntrackCtV4Key, value *conntrackCtEntry, isReply bool, bytesSeen, packetsSeen uint32, prevFlags utils.TCPFlagCounts, reason string) {
+	// No current packet in a reap flow: carry counts as previously-observed, minus
+	// one packet since forward metrics add one for the (here absent) reporting packet.
+	prevPackets := uint32(0)
+	if packetsSeen > 0 {
+		prevPackets = packetsSeen - 1
+	}
+	// CurrentTCPFlags nil and TCPID 0: a reap flow has no current packet.
+	fl := utils.BuildForwardedFlow(ct.l, utils.ForwardFlowParams{
+		Timestamp:                 time.Now().UnixNano(),
+		SourceIP:                  utils.Int2ip(key.SrcIp).To4(),
+		DestIP:                    utils.Int2ip(key.DstIp).To4(),
+		SourcePort:                uint32(utils.HostToNetShort(key.SrcPort)),
+		DestPort:                  uint32(utils.HostToNetShort(key.DstPort)),
+		Proto:                     key.Proto,
+		ObservationPoint:          reapObservationPoint(value.TrafficDirection),
+		IsReply:                   isReply,
+		TrafficDirection:          value.TrafficDirection,
+		PreviouslyObservedBytes:   bytesSeen,
+		PreviouslyObservedPackets: prevPackets,
+		PreviouslyObservedFlags:   prevFlags,
+	})
+	if fl == nil {
+		return
+	}
+	e.Write(&v1.Event{Event: fl, Timestamp: fl.GetTime()})
+	metrics.ConntrackReapFlowsCounter.WithLabelValues(reason).Inc()
+}
+
+func reapObservationPoint(trafficDirection uint8) uint8 {
+	switch trafficDirection {
+	case 2: // egress
+		return 3 // to network
+	case 1: // ingress
+		return 2 // from network
+	default:
+		return 0
 	}
 }

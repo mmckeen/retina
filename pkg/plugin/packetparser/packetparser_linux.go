@@ -15,9 +15,7 @@ import (
 	"sync"
 
 	"github.com/pkg/errors"
-	"google.golang.org/protobuf/types/known/wrapperspb"
 
-	"github.com/cilium/cilium/api/v1/flow"
 	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
@@ -777,6 +775,38 @@ func (p *packetParser) run(ctx context.Context) error {
 	return nil
 }
 
+// Report reasons, matching REPORT_REASON_* in conntrack.h.
+const (
+	reportReasonNewConnection uint8 = iota
+	reportReasonInterval
+	reportReasonFlagChange
+	reportReasonTCPFlags
+	reportReasonFinalACK
+	reportReasonRST
+	reportReasonTimeout
+)
+
+func reportReasonString(r uint8) string {
+	switch r {
+	case reportReasonNewConnection:
+		return "new_connection"
+	case reportReasonInterval:
+		return "interval"
+	case reportReasonFlagChange:
+		return "flag_change"
+	case reportReasonTCPFlags:
+		return "tcp_flags"
+	case reportReasonFinalACK:
+		return "final_ack"
+	case reportReasonRST:
+		return "rst"
+	case reportReasonTimeout:
+		return "timeout"
+	default:
+		return "unknown"
+	}
+}
+
 // This is the data consumer.
 // There will more than one of these.
 func (p *packetParser) processRecord(ctx context.Context, id int) {
@@ -794,8 +824,6 @@ func (p *packetParser) processRecord(ctx context.Context, id int) {
 				zap.Int("worker_id", id),
 			)
 
-			metrics.ParsedPacketsCounter.WithLabelValues().Inc()
-
 			var bpfEvent packetparserPacket
 			err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &bpfEvent)
 			if err != nil {
@@ -803,79 +831,65 @@ func (p *packetParser) processRecord(ctx context.Context, id int) {
 				continue
 			}
 
+			metrics.ParsedPacketsCounter.WithLabelValues(reportReasonString(bpfEvent.ReportReason)).Inc()
+
 			// Post processing of the bpfEvent.
 			// Anything after this is required only for Pod level metrics.
 			sourcePortShort := uint32(utils.HostToNetShort(bpfEvent.SrcPort))
 			destinationPortShort := uint32(utils.HostToNetShort(bpfEvent.DstPort))
 
-			fl := utils.ToFlow(
-				p.l,
-				ktime.MonotonicOffset.Nanoseconds()+int64(bpfEvent.T_nsec),
-				utils.Int2ip(bpfEvent.SrcIp).To4(), // Precautionary To4() call.
-				utils.Int2ip(bpfEvent.DstIp).To4(), // Precautionary To4() call.
-				sourcePortShort,
-				destinationPortShort,
-				bpfEvent.Proto,
-				bpfEvent.ObservationPoint,
-				flow.Verdict_FORWARDED,
-			)
+			// For packets originating from node, we use tsval as the tcpID.
+			// Packets coming back have the tsval echoed in tsecr.
+			tcpMetadata := bpfEvent.TcpMetadata
+			var tcpID uint64
+			switch bpfEvent.ObservationPoint {
+			case 3: // OBSERVATION_POINT_TO_NETWORK
+				tcpID = uint64(tcpMetadata.Tsval)
+			case 2: // OBSERVATION_POINT_FROM_NETWORK
+				tcpID = uint64(tcpMetadata.Tsecr)
+			}
+
+			fl := utils.BuildForwardedFlow(p.l, utils.ForwardFlowParams{
+				Timestamp:                 ktime.MonotonicOffset.Nanoseconds() + int64(bpfEvent.T_nsec),
+				SourceIP:                  utils.Int2ip(bpfEvent.SrcIp).To4(), // Precautionary To4() call.
+				DestIP:                    utils.Int2ip(bpfEvent.DstIp).To4(), // Precautionary To4() call.
+				SourcePort:                sourcePortShort,
+				DestPort:                  destinationPortShort,
+				Proto:                     bpfEvent.Proto,
+				ObservationPoint:          bpfEvent.ObservationPoint,
+				IsReply:                   bpfEvent.IsReply,
+				TrafficDirection:          bpfEvent.TrafficDirection,
+				PacketSize:                bpfEvent.Bytes,
+				PreviouslyObservedBytes:   bpfEvent.PreviouslyObservedBytes,
+				PreviouslyObservedPackets: bpfEvent.PreviouslyObservedPackets,
+				CurrentTCPFlags: &utils.TCPFlags{
+					Syn: uint16((bpfEvent.Flags & TCPFlagSYN) >> 1),
+					Ack: uint16((bpfEvent.Flags & TCPFlagACK) >> 4), // nolint:gomnd // 4 is the offset for ACK.
+					Fin: uint16((bpfEvent.Flags & TCPFlagFIN) >> 0),
+					Rst: uint16((bpfEvent.Flags & TCPFlagRST) >> 2), // nolint:gomnd // 2 is the offset for RST.
+					Psh: uint16((bpfEvent.Flags & TCPFlagPSH) >> 3), // nolint:gomnd // 3 is the offset for PSH.
+					Urg: uint16((bpfEvent.Flags & TCPFlagURG) >> 5), // nolint:gomnd // 5 is the offset for URG.
+					Ece: uint16((bpfEvent.Flags & TCPFlagECE) >> 6), // nolint:gomnd // 6 is the offset for ECE.
+					Cwr: uint16((bpfEvent.Flags & TCPFlagCWR) >> 7), // nolint:gomnd // 7 is the offset for CWR.
+					Ns:  uint16((bpfEvent.Flags & TCPFlagNS) >> 8),  // nolint:gomnd // 8 is the offset for NS.
+				},
+				PreviouslyObservedFlags: utils.TCPFlagCounts{
+					Syn: bpfEvent.PreviouslyObservedFlags.Syn,
+					Ack: bpfEvent.PreviouslyObservedFlags.Ack,
+					Fin: bpfEvent.PreviouslyObservedFlags.Fin,
+					Rst: bpfEvent.PreviouslyObservedFlags.Rst,
+					Psh: bpfEvent.PreviouslyObservedFlags.Psh,
+					Urg: bpfEvent.PreviouslyObservedFlags.Urg,
+					Ece: bpfEvent.PreviouslyObservedFlags.Ece,
+					Cwr: bpfEvent.PreviouslyObservedFlags.Cwr,
+					Ns:  bpfEvent.PreviouslyObservedFlags.Ns,
+				},
+				TCPID: tcpID,
+			})
 			if fl == nil {
 				p.l.Warn("Could not convert bpfEvent to flow", zap.Any("bpfEvent", bpfEvent))
 				continue
 			}
-
-			// Add the isReply flag to the flow.
-			fl.IsReply = &wrapperspb.BoolValue{Value: bpfEvent.IsReply}
-
-			// Add the traffic direction to the flow.
-			fl.TrafficDirection = flow.TrafficDirection(bpfEvent.TrafficDirection)
-
-			ext := utils.NewExtensions()
-
-			// Add packet size to the flow's extensions.
-			utils.AddPacketSize(ext, bpfEvent.Bytes)
-
-			// Add previously observed byte and packet counts to the flow's extensions
-			utils.AddPreviouslyObservedBytes(ext, bpfEvent.PreviouslyObservedBytes)
-			utils.AddPreviouslyObservedPackets(ext, bpfEvent.PreviouslyObservedPackets)
-
-			// Add the TCP metadata to the flow.
-			tcpMetadata := bpfEvent.TcpMetadata
-			utils.AddTCPFlags(
-				fl,
-				uint16((bpfEvent.Flags&TCPFlagSYN)>>1),
-				uint16((bpfEvent.Flags&TCPFlagACK)>>4), // nolint:gomnd // 4 is the offset for ACK.
-				uint16((bpfEvent.Flags&TCPFlagFIN)>>0),
-				uint16((bpfEvent.Flags&TCPFlagRST)>>2), // nolint:gomnd // 2 is the offset for RST.
-				uint16((bpfEvent.Flags&TCPFlagPSH)>>3), // nolint:gomnd // 3 is the offset for PSH.
-				uint16((bpfEvent.Flags&TCPFlagURG)>>5), // nolint:gomnd // 5 is the offset for URG.
-				uint16((bpfEvent.Flags&TCPFlagECE)>>6), // nolint:gomnd // 6 is the offset for ECE.
-				uint16((bpfEvent.Flags&TCPFlagCWR)>>7), // nolint:gomnd // 7 is the offset for CWR.
-				uint16((bpfEvent.Flags&TCPFlagNS)>>8),  // nolint:gomnd // 8 is the offset for NS.
-			)
-			utils.AddPreviouslyObservedTCPFlags(
-				ext,
-				bpfEvent.PreviouslyObservedFlags.Syn,
-				bpfEvent.PreviouslyObservedFlags.Ack,
-				bpfEvent.PreviouslyObservedFlags.Fin,
-				bpfEvent.PreviouslyObservedFlags.Rst,
-				bpfEvent.PreviouslyObservedFlags.Psh,
-				bpfEvent.PreviouslyObservedFlags.Urg,
-				bpfEvent.PreviouslyObservedFlags.Ece,
-				bpfEvent.PreviouslyObservedFlags.Cwr,
-				bpfEvent.PreviouslyObservedFlags.Ns,
-			)
-
-			// For packets originating from node, we use tsval as the tcpID.
-			// Packets coming back has the tsval echoed in tsecr.
-			if fl.GetTraceObservationPoint() == flow.TraceObservationPoint_TO_NETWORK {
-				utils.AddTCPID(ext, uint64(tcpMetadata.Tsval))
-			} else if fl.GetTraceObservationPoint() == flow.TraceObservationPoint_FROM_NETWORK {
-				utils.AddTCPID(ext, uint64(tcpMetadata.Tsecr))
-			}
-
-			// Set extensions on the flow.
-			utils.SetExtensions(fl, ext)
 
 			// Write the event to the enricher.
 			ev := &v1.Event{

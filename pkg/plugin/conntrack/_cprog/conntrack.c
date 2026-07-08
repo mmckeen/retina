@@ -62,6 +62,7 @@ struct packet
     __u8 proto;
     __u16 flags; // For TCP packets, this is the TCP flags. For UDP packets, this is will always be 1 for conntrack purposes.
     bool is_reply;
+    __u8 report_reason; // Why this packet was reported to userspace. One of REPORT_REASON_*.
     __u32 previously_observed_packets; // When sampling, this is the number of observed packets since the last report.
     __u32 previously_observed_bytes; // When sampling, this is the number of observed bytes since the last report.
     struct tcpflagscount previously_observed_flags; // When sampling, this is the previously observed TCP flags since the last report.
@@ -77,6 +78,13 @@ struct packetreport
     __u32 previously_observed_bytes;
     struct tcpflagscount previously_observed_flags;
     bool report;
+    __u8 report_reason; // One of REPORT_REASON_*; valid when report is true.
+    // On terminal close (RST/final-ACK/timeout) the entry is deleted in-kernel, so the
+    // opposite direction's unreported bytes are flushed as a separate event first.
+    bool flush_reverse;
+    __u32 reverse_previously_observed_packets;
+    __u32 reverse_previously_observed_bytes;
+    struct tcpflagscount reverse_previously_observed_flags;
 };
 
 /**
@@ -246,7 +254,7 @@ static __always_inline bool _ct_create_new_tcp_connection(struct packet *p, stru
     new_value.eviction_time = now + CT_SYN_TIMEOUT;
     if(is_reply) {
         new_value.flags_seen_rx_dir = p->flags;
-        new_value.last_report_rx_dir = sampled ? now : 0;
+        new_value.last_report_rx_dir = now;
         new_value.bytes_seen_since_last_report_rx_dir = !sampled ? p->bytes : 0;
         new_value.packets_seen_since_last_report_rx_dir = !sampled;
         if (!sampled) {
@@ -254,7 +262,7 @@ static __always_inline bool _ct_create_new_tcp_connection(struct packet *p, stru
         }
     } else {
         new_value.flags_seen_tx_dir = p->flags;
-        new_value.last_report_tx_dir = sampled ? now : 0;
+        new_value.last_report_tx_dir = now;
         new_value.bytes_seen_since_last_report_tx_dir = !sampled ? p->bytes : 0;
         new_value.packets_seen_since_last_report_tx_dir = !sampled;
         if (!sampled) {
@@ -303,7 +311,7 @@ static __always_inline bool _ct_handle_udp_connection(struct packet *p, struct c
     }
     new_value.eviction_time = now + CT_CONNECTION_LIFETIME_NONTCP;
     new_value.flags_seen_tx_dir = p->flags;
-    new_value.last_report_tx_dir = sampled ? now : 0;
+    new_value.last_report_tx_dir = now;
     new_value.bytes_seen_since_last_report_tx_dir = !sampled ? p->bytes : 0;
     new_value.packets_seen_since_last_report_tx_dir = !sampled;
     new_value.traffic_direction = _ct_get_traffic_direction(observation_point);
@@ -362,7 +370,7 @@ static __always_inline bool _ct_handle_tcp_connection(struct packet *p, struct c
     if (p->flags & TCP_ACK) {
         p->is_reply = true;
         new_value.flags_seen_rx_dir = p->flags;
-        new_value.last_report_rx_dir = sampled ? now : 0;
+        new_value.last_report_rx_dir = now;
         new_value.bytes_seen_since_last_report_rx_dir = !sampled ? p->bytes : 0;
         new_value.packets_seen_since_last_report_rx_dir = !sampled;
         if (!sampled) {
@@ -376,7 +384,7 @@ static __always_inline bool _ct_handle_tcp_connection(struct packet *p, struct c
     } else { // Otherwise, the packet is considered as a packet in the send direction.
         p->is_reply = false;
         new_value.flags_seen_tx_dir = p->flags;
-        new_value.last_report_tx_dir = sampled ? now : 0;
+        new_value.last_report_tx_dir = now;
         new_value.bytes_seen_since_last_report_tx_dir = !sampled ? p->bytes : 0;
         new_value.packets_seen_since_last_report_tx_dir = !sampled;
         if (!sampled) {
@@ -417,6 +425,36 @@ static __always_inline struct packetreport _ct_handle_new_connection(struct pack
         report.report = false; // We are not interested in other protocols.
     }
     return report;
+}
+
+/**
+ * Record the opposite direction's unreported bytes/packets/flags into the report so they can be
+ * emitted as a separate flow before the entry is deleted in-kernel on terminal close.
+ * The packet count is pre-decremented because userspace adds one for the (absent) reporting packet.
+ * No-op when the opposite direction has no unreported bytes.
+ * @arg report The packet report to populate with the reverse-direction data.
+ * @arg entry The entry of the connection in Retina's conntrack map.
+ * @arg direction The direction of the current packet; the opposite direction is flushed.
+ */
+static __always_inline void _ct_fill_reverse_flush(struct packetreport *report, struct ct_entry *entry, __u8 direction) {
+    __u32 bytes, packets;
+    struct tcpflagscount *flags;
+    if (direction == CT_PACKET_DIR_TX) {
+        bytes = READ_ONCE(entry->bytes_seen_since_last_report_rx_dir);
+        packets = READ_ONCE(entry->packets_seen_since_last_report_rx_dir);
+        flags = &entry->flags_seen_since_last_report_rx_dir;
+    } else {
+        bytes = READ_ONCE(entry->bytes_seen_since_last_report_tx_dir);
+        packets = READ_ONCE(entry->packets_seen_since_last_report_tx_dir);
+        flags = &entry->flags_seen_since_last_report_tx_dir;
+    }
+    if (bytes == 0) {
+        return;
+    }
+    report->flush_reverse = true;
+    report->reverse_previously_observed_bytes = bytes;
+    report->reverse_previously_observed_packets = packets > 0 ? packets - 1 : 0;
+    __builtin_memcpy(&report->reverse_previously_observed_flags, flags, sizeof(struct tcpflagscount));
 }
 
 /**
@@ -475,8 +513,10 @@ static __always_inline struct packetreport _ct_should_report_packet(struct ct_v4
 
     // Check if the connection timed out
     if (now >= eviction_time) {
+        _ct_fill_reverse_flush(&report, entry, direction);
         bpf_map_delete_elem(&retina_conntrack, key);
         report.report = true;
+        report.report_reason = REPORT_REASON_TIMEOUT;
         return report; // Report the last packet received before deletion
     }
 
@@ -497,17 +537,21 @@ static __always_inline struct packetreport _ct_should_report_packet(struct ct_v4
         // (Both directions have seen FIN, and this is just an ACK without other control flags)
         if ((flags & TCP_ACK) && 
             !(flags & (TCP_FIN | TCP_SYN | TCP_RST)) && 
-            (entry->flags_seen_tx_dir & TCP_FIN) && 
+            (entry->flags_seen_tx_dir & TCP_FIN) &&
             (entry->flags_seen_rx_dir & TCP_FIN)) {
+            _ct_fill_reverse_flush(&report, entry, direction);
             bpf_map_delete_elem(&retina_conntrack, key);
             report.report = true;
+            report.report_reason = REPORT_REASON_FINAL_ACK;
             return report; // Report final ACK before connection removal
         }
 
         // If RST is seen, delete connection immediately
         if (flags & TCP_RST) {
+            _ct_fill_reverse_flush(&report, entry, direction);
             bpf_map_delete_elem(&retina_conntrack, key);
             report.report = true;
+            report.report_reason = REPORT_REASON_RST;
             return report; // Report RST before connection removal
         }
 
@@ -518,7 +562,6 @@ static __always_inline struct packetreport _ct_should_report_packet(struct ct_v4
             } else {
                 entry->flags_seen_rx_dir |= TCP_FIN;
             }
-            should_report = true; // Always report FIN packets
         }
 
         // Always report important TCP control flags
@@ -529,7 +572,6 @@ static __always_inline struct packetreport _ct_should_report_packet(struct ct_v4
         // If FIN seen in both directions, transition to TIME_WAIT state
         if ((entry->flags_seen_tx_dir & TCP_FIN) && (entry->flags_seen_rx_dir & TCP_FIN)) {
             WRITE_ONCE(entry->eviction_time, now + CT_TIME_WAIT_TIMEOUT_TCP);
-            should_report = true; // Report transition to TIME_WAIT
         } else {
             // Extend TCP connection lifetime
             WRITE_ONCE(entry->eviction_time, now + CT_CONNECTION_LIFETIME_TCP);
@@ -553,6 +595,13 @@ static __always_inline struct packetreport _ct_should_report_packet(struct ct_v4
     // 3. Reporting interval has elapsed
     if (should_report || (sampled && flags != seen_flags) || now - last_report >= CT_REPORT_INTERVAL) {
         report.report = true;
+        if (should_report) {
+            report.report_reason = REPORT_REASON_TCP_FLAGS;
+        } else if (sampled && flags != seen_flags) {
+            report.report_reason = REPORT_REASON_FLAG_CHANGE;
+        } else {
+            report.report_reason = REPORT_REASON_INTERVAL;
+        }
         // Update the connection's state
         if (direction == CT_PACKET_DIR_TX) {
             WRITE_ONCE(entry->last_report_tx_dir, now);

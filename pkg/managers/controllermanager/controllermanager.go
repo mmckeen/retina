@@ -85,7 +85,11 @@ func (m *Controller) Init(ctx context.Context) error {
 		m.cache = cache.New(m.pubsub)
 
 		// create enricher instance
-		m.enricher = enricher.New(ctx, m.cache)
+		ringCap, err := enricher.RingCapacityOrDefault(m.conf.EnricherRingCapacity)
+		if err != nil {
+			return err
+		}
+		m.enricher = enricher.New(ctx, m.cache, ringCap)
 	}
 
 	return nil

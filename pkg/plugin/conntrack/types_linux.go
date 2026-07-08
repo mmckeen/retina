@@ -34,6 +34,12 @@ const (
 	TCP_CWR = 0x80 // nolint:revive // Acceptable as flag
 )
 
+// IP protocol numbers.
+const (
+	protoTCP = 6  // nolint:gomnd // IPPROTO_TCP
+	protoUDP = 17 // nolint:gomnd // IPPROTO_UDP
+)
+
 // decodeFlags decodes the TCP flags into a human-readable string
 func decodeFlags(flags uint8) string {
 	var flagDescriptions []string
@@ -69,9 +75,9 @@ func decodeFlags(flags uint8) string {
 
 func decodeProto(proto uint8) string {
 	switch proto {
-	case 6: // nolint:gomnd // TCP
+	case protoTCP:
 		return "TCP"
-	case 17: // nolint:gomnd // UDP
+	case protoUDP:
 		return "UDP"
 	default:
 		return "Not supported"

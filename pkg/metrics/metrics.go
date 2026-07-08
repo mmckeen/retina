@@ -132,6 +132,14 @@ func InitializeMetrics(logger *slog.Logger) {
 		utils.Reason,
 	)
 
+	// ConntrackReapFlowsCounter counts flows emitted when conntrack entries are reaped.
+	ConntrackReapFlowsCounter = exporter.CreatePrometheusCounterVecForControlPlaneMetric(
+		exporter.DefaultRegistry,
+		conntrackReapFlowsCounterName,
+		conntrackReapFlowsCounterDescription,
+		reasonLabel,
+	)
+
 	// DNS Metrics.
 	DNSRequestCounter = exporter.CreatePrometheusCounterVecForMetric(
 		exporter.DefaultRegistry,
@@ -196,6 +204,7 @@ func InitializeMetrics(logger *slog.Logger) {
 		exporter.DefaultRegistry,
 		parsedPacketsCounterName,
 		parsedPacketsCounterDescription,
+		reasonLabel,
 	)
 
 	MetricsExpiredCounter = exporter.CreatePrometheusCounterVecForControlPlaneMetric(

@@ -12,6 +12,7 @@ import (
 
 	"github.com/cilium/cilium/api/v1/flow"
 	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
+	"github.com/cilium/cilium/pkg/hubble/container"
 	retinav1alpha1 "github.com/microsoft/retina/crd/api/v1alpha1"
 	"github.com/microsoft/retina/pkg/common"
 	"github.com/microsoft/retina/pkg/controllers/cache"
@@ -102,7 +103,7 @@ func TestEnricher(t *testing.T) {
 	err = c.UpdateRetinaEndpoint(destPod)
 	require.NoError(t, err)
 
-	e := newEnricher(context.Background(), c)
+	e := newEnricher(context.Background(), c, container.Capacity1023)
 
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -159,7 +160,7 @@ func TestEnricherSecondaryIPs(t *testing.T) {
 	require.NoError(t, err)
 
 	// create new enricher (not using singleton here)
-	e := newEnricher(ctx, c)
+	e := newEnricher(ctx, c, container.Capacity1023)
 	var wg sync.WaitGroup
 
 	wg.Add(1)
@@ -279,7 +280,7 @@ func TestEnricherZoneResolution(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	e := newEnricher(ctx, c)
+	e := newEnricher(ctx, c, container.Capacity1023)
 
 	// Get the export reader before running and writing, so we don't miss events.
 	oreader := e.ExportReader()
@@ -330,7 +331,7 @@ func TestEnricherZoneResolution_NoNode(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	e := newEnricher(ctx, c)
+	e := newEnricher(ctx, c, container.Capacity1023)
 
 	oreader := e.ExportReader()
 	e.Run()

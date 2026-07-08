@@ -41,26 +41,35 @@ type Enricher struct {
 	outputRing *container.Ring
 }
 
-func New(ctx context.Context, c cache.CacheInterface) *Enricher {
+func New(ctx context.Context, c cache.CacheInterface, ringCapacity container.Capacity) *Enricher {
 	once.Do(func() {
-		e = newEnricher(ctx, c)
+		e = newEnricher(ctx, c, ringCapacity)
 	})
 
 	return e
 }
 
-func newEnricher(ctx context.Context, c cache.CacheInterface) *Enricher {
-	ir := container.NewRing(container.Capacity1023)
+func newEnricher(ctx context.Context, c cache.CacheInterface, ringCapacity container.Capacity) *Enricher {
+	ir := container.NewRing(ringCapacity)
 	enricher := &Enricher{
 		ctx:        ctx,
 		l:          log.Logger().Named("enricher"),
 		cache:      c,
 		inputRing:  ir,
 		Reader:     container.NewRingReader(ir, ir.OldestWrite()),
-		outputRing: container.NewRing(container.Capacity1023),
+		outputRing: container.NewRing(ringCapacity),
 	}
 	initialized = true
 	return enricher
+}
+
+// RingCapacityOrDefault converts a configured ring capacity to a container.Capacity,
+// using the default when n is 0. n must be one less than a power of two.
+func RingCapacityOrDefault(n uint32) (container.Capacity, error) {
+	if n == 0 {
+		return container.Capacity1023, nil
+	}
+	return container.NewCapacity(int(n))
 }
 
 func Instance() *Enricher {

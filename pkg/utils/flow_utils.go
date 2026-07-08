@@ -146,6 +146,64 @@ func ToFlow(
 	return f
 }
 
+// BuildForwardedFlow builds a FORWARDED flow with IsReply, traffic direction, and
+// packet-size / previously-observed byte and packet extensions set. It returns the
+// flow and its (not-yet-attached) extensions so callers can add more extensions
+// (e.g. TCP flags) before calling SetExtensions. Returns nil if the flow can't be built.
+// TCPFlags holds current-packet TCP flag bits (0 or 1 each).
+type TCPFlags struct {
+	Syn, Ack, Fin, Rst, Psh, Urg, Ece, Cwr, Ns uint16
+}
+
+// TCPFlagCounts holds observed per-flag counts (for previously-observed flags).
+type TCPFlagCounts struct {
+	Syn, Ack, Fin, Rst, Psh, Urg, Ece, Cwr, Ns uint32
+}
+
+// ForwardFlowParams is the full input to BuildForwardedFlow. Producers that lack a
+// field (e.g. conntrack reap flows have no current packet) leave it zero/nil.
+type ForwardFlowParams struct {
+	Timestamp                 int64
+	SourceIP, DestIP          net.IP
+	SourcePort, DestPort      uint32
+	Proto                     uint8
+	ObservationPoint          uint8
+	IsReply                   bool
+	TrafficDirection          uint8
+	PacketSize                uint32
+	PreviouslyObservedBytes   uint32
+	PreviouslyObservedPackets uint32
+	CurrentTCPFlags           *TCPFlags // nil when there is no current packet (reap)
+	PreviouslyObservedFlags   TCPFlagCounts
+	TCPID                     uint64 // 0 to omit
+}
+
+// BuildForwardedFlow builds a fully-populated FORWARDED flow — core fields, current
+// TCP flags, and all extensions — so every producer (packetparser, conntrack reap)
+// emits identical metadata. Returns nil if the flow cannot be built.
+func BuildForwardedFlow(l *log.ZapLogger, p ForwardFlowParams) *flow.Flow {
+	fl := ToFlow(l, p.Timestamp, p.SourceIP, p.DestIP, p.SourcePort, p.DestPort, p.Proto, p.ObservationPoint, flow.Verdict_FORWARDED)
+	if fl == nil {
+		return nil
+	}
+	fl.IsReply = &wrapperspb.BoolValue{Value: p.IsReply}
+	fl.TrafficDirection = flow.TrafficDirection(p.TrafficDirection)
+
+	if f := p.CurrentTCPFlags; f != nil {
+		AddTCPFlags(fl, f.Syn, f.Ack, f.Fin, f.Rst, f.Psh, f.Urg, f.Ece, f.Cwr, f.Ns)
+	}
+
+	ext := NewExtensions()
+	AddPacketSize(ext, p.PacketSize)
+	AddPreviouslyObservedBytes(ext, p.PreviouslyObservedBytes)
+	AddPreviouslyObservedPackets(ext, p.PreviouslyObservedPackets)
+	pf := p.PreviouslyObservedFlags
+	AddPreviouslyObservedTCPFlags(ext, pf.Syn, pf.Ack, pf.Fin, pf.Rst, pf.Psh, pf.Urg, pf.Ece, pf.Cwr, pf.Ns)
+	AddTCPID(ext, p.TCPID) // no-op when 0
+	SetExtensions(fl, ext)
+	return fl
+}
+
 // NewExtensions creates a new structpb.Struct for use as flow extensions.
 func NewExtensions() *structpb.Struct {
 	return &structpb.Struct{Fields: make(map[string]*structpb.Value)}

@@ -12,8 +12,12 @@ const (
 	// Control plane metrics
 	pluginManagerFailedToReconcileCounterName = "plugin_manager_failed_to_reconcile"
 	lostEventsCounterName                     = "lost_events_counter"
+	conntrackReapFlowsCounterName             = "conntrack_reap_flows"
 	parsedPacketsCounterName                  = "parsed_packets_counter"
 	expiredMetricsCounterName                 = "expired_metrics_counter"
+
+	// reasonLabel labels reap/parsed-packet counters by the trigger that produced the event.
+	reasonLabel = "reason"
 
 	// Windows
 	hnsStats            = "windows_hns_stats"
@@ -45,6 +49,7 @@ const (
 	// Control plane metrics
 	pluginManagerFailedToReconcileCounterDescription = "Number of times the plugin manager failed to reconcile the plugins"
 	lostEventsCounterDescription                     = "Number of events lost in control plane"
+	conntrackReapFlowsCounterDescription             = "Number of flows emitted when conntrack entries are reaped"
 	parsedPacketsCounterDescription                  = "Number of packets parsed by the packetparser plugin"
 	expiredMetricsCounterDescription                 = "Number of metrics expired due to lack of updates and no longer exported"
 
@@ -94,6 +99,7 @@ var (
 	// Control Plane Metrics
 	PluginManagerFailedToReconcileCounter CounterVec
 	LostEventsCounter                     CounterVec
+	ConntrackReapFlowsCounter             CounterVec
 	ParsedPacketsCounter                  CounterVec
 	MetricsExpiredCounter                 CounterVec
 

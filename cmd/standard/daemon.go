@@ -245,7 +245,11 @@ func (d *Daemon) Start() error {
 	if daemonConfig.EnablePodLevel {
 		pubSub := pubsub.New()
 		controllerCache := controllercache.New(pubSub)
-		enrich := enricher.New(ctx, controllerCache)
+		ringCap, err := enricher.RingCapacityOrDefault(daemonConfig.EnricherRingCapacity)
+		if err != nil {
+			mainLogger.Fatal("invalid enricher ring capacity", zap.Error(err))
+		}
+		enrich := enricher.New(ctx, controllerCache, ringCap)
 		//nolint:govet // shadowing this err is fine
 		fm, err := filtermanager.Init(5, daemonConfig.FilterMapMaxEntries) //nolint:gomnd // defaults
 		if err != nil {
