@@ -87,6 +87,7 @@ type AdvMetricsInterface interface {
 type ContextOptionsInterface interface {
 	getLabels() []string
 	getValues(f *flow.Flow) []string
+	getReverseValues(f *flow.Flow) []string
 	getLocalCtxValues(f *flow.Flow) map[string][]string
 }
 
@@ -185,6 +186,25 @@ func (c *ContextOptions) getLabels() []string {
 
 func (c *ContextOptions) getValues(f *flow.Flow) []string {
 	return c.getByDirectionValues(f, c.isDest())
+}
+
+// getReverseValues returns the context values read from the opposite direction,
+// used to attribute an opposite-direction count to the reply direction's labels.
+func (c *ContextOptions) getReverseValues(f *flow.Flow) []string {
+	return c.getByDirectionValues(f, !c.isDest())
+}
+
+// reverseTrafficDirection flips ingress/egress so the opposite direction's counts
+// can be attributed to the reply direction's labels.
+func reverseTrafficDirection(d flow.TrafficDirection) flow.TrafficDirection {
+	switch d {
+	case flow.TrafficDirection_INGRESS:
+		return flow.TrafficDirection_EGRESS
+	case flow.TrafficDirection_EGRESS:
+		return flow.TrafficDirection_INGRESS
+	default:
+		return d
+	}
 }
 
 func (c *ContextOptions) isDest() bool {

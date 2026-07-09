@@ -164,6 +164,20 @@ func (mr *MockContextOptionsInterfaceMockRecorder) getLocalCtxValues(f any) *gom
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "getLocalCtxValues", reflect.TypeOf((*MockContextOptionsInterface)(nil).getLocalCtxValues), f)
 }
 
+// getReverseValues mocks base method.
+func (m *MockContextOptionsInterface) getReverseValues(f *flow.Flow) []string {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "getReverseValues", f)
+	ret0, _ := ret[0].([]string)
+	return ret0
+}
+
+// getReverseValues indicates an expected call of getReverseValues.
+func (mr *MockContextOptionsInterfaceMockRecorder) getReverseValues(f any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "getReverseValues", reflect.TypeOf((*MockContextOptionsInterface)(nil).getReverseValues), f)
+}
+
 // getValues mocks base method.
 func (m *MockContextOptionsInterface) getValues(f *flow.Flow) []string {
 	m.ctrl.T.Helper()

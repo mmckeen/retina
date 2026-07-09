@@ -866,6 +866,24 @@ func (p *packetParser) processRecord(ctx context.Context, id int) {
 				bpfEvent.PreviouslyObservedFlags.Ns,
 			)
 
+			// Opposite-direction counts flushed on terminal delete, so bidirectional
+			// flows are not undercounted under sampling. Attributed to the reverse
+			// direction by the metric modules.
+			utils.AddPreviouslyObservedBytesReverse(ext, bpfEvent.PreviouslyObservedBytesReverse)
+			utils.AddPreviouslyObservedPacketsReverse(ext, bpfEvent.PreviouslyObservedPacketsReverse)
+			utils.AddPreviouslyObservedTCPFlagsReverse(
+				ext,
+				bpfEvent.PreviouslyObservedFlagsReverse.Syn,
+				bpfEvent.PreviouslyObservedFlagsReverse.Ack,
+				bpfEvent.PreviouslyObservedFlagsReverse.Fin,
+				bpfEvent.PreviouslyObservedFlagsReverse.Rst,
+				bpfEvent.PreviouslyObservedFlagsReverse.Psh,
+				bpfEvent.PreviouslyObservedFlagsReverse.Urg,
+				bpfEvent.PreviouslyObservedFlagsReverse.Ece,
+				bpfEvent.PreviouslyObservedFlagsReverse.Cwr,
+				bpfEvent.PreviouslyObservedFlagsReverse.Ns,
+			)
+
 			// For packets originating from node, we use tsval as the tcpID.
 			// Packets coming back has the tsval echoed in tsecr.
 			if fl.GetTraceObservationPoint() == flow.TraceObservationPoint_TO_NETWORK {

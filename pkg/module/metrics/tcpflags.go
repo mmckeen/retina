@@ -128,6 +128,23 @@ func (t *TCPMetrics) ProcessFlow(flow *v1.Flow) {
 		t.update(labels, count)
 		t.getLogger().Debug("TCP flag metric", zap.String("flag", flag), zap.Strings("labels", labels), zap.Uint32("count", count))
 	}
+
+	// Attribute the opposite direction's flags (flushed on terminal delete) to the
+	// reply direction by swapping the source/destination context values.
+	if reverseFlags := utils.PreviouslyObservedTCPFlagsReverse(flow); len(reverseFlags) > 0 {
+		var revSrc, revDst []string
+		if t.sourceCtx() != nil {
+			revSrc = t.sourceCtx().getReverseValues(flow)
+		}
+		if t.destinationCtx() != nil {
+			revDst = t.destinationCtx().getReverseValues(flow)
+		}
+		for flag, count := range reverseFlags {
+			labels := append([]string{flag}, revSrc...)
+			labels = append(labels, revDst...)
+			t.update(labels, count)
+		}
+	}
 }
 
 func (t *TCPMetrics) processLocalCtxFlow(flow *v1.Flow, flags []string) {
@@ -137,6 +154,9 @@ func (t *TCPMetrics) processLocalCtxFlow(flow *v1.Flow, flags []string) {
 	}
 
 	combinedFlags := combineFlagsWithPrevious(flags, flow)
+	// Opposite direction's flags flushed on terminal delete. Local-context labels
+	// carry no direction, so these add to the same per-pod series.
+	reverseFlags := utils.PreviouslyObservedTCPFlagsReverse(flow)
 
 	// Ingress values
 	if l := len(labelValuesMap[ingress]); l > 0 {
@@ -145,6 +165,10 @@ func (t *TCPMetrics) processLocalCtxFlow(flow *v1.Flow, flags []string) {
 			t.update(labels, count)
 			t.getLogger().Debug("TCP flag metric", zap.String("flag", flag), zap.Strings("labels", labels), zap.Uint32("count", count))
 		}
+		for flag, count := range reverseFlags {
+			labels := append([]string{flag}, labelValuesMap[ingress]...)
+			t.update(labels, count)
+		}
 	}
 
 	if l := len(labelValuesMap[egress]); l > 0 {
@@ -152,6 +176,10 @@ func (t *TCPMetrics) processLocalCtxFlow(flow *v1.Flow, flags []string) {
 			labels := append([]string{flag}, labelValuesMap[egress]...)
 			t.update(labels, count)
 			t.getLogger().Debug("TCP flag metric", zap.String("flag", flag), zap.Strings("labels", labels), zap.Uint32("count", count))
+		}
+		for flag, count := range reverseFlags {
+			labels := append([]string{flag}, labelValuesMap[egress]...)
+			t.update(labels, count)
 		}
 	}
 }

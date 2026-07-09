@@ -183,10 +183,6 @@ static void parse(struct __sk_buff *skb, __u8 obs)
 		// Get all TCP flags.
 		p.flags = (tcp->fin << 0) | (tcp->syn << 1) | (tcp->rst << 2) | (tcp->psh << 3) | (tcp->ack << 4) | (tcp->urg << 5) | (tcp->ece << 6) | (tcp->cwr << 7);
 
-		tcp_metadata.seq = tcp->seq;
-		tcp_metadata.ack_num = tcp->ack_seq;
-		p.tcp_metadata = tcp_metadata;
-
 		// Get TSval/TSecr from TCP header.
 		if (parse_tcp_ts(tcp, data_end, &tcp_metadata.tsval, &tcp_metadata.tsecr) == 0)
 		{
@@ -209,12 +205,6 @@ static void parse(struct __sk_buff *skb, __u8 obs)
 		return;
 	}
 
-	#ifdef ENABLE_CONNTRACK_METRICS
-		// Initialize conntrack metadata in packet struct.
-		struct conntrackmetadata conntrack_metadata;
-		__builtin_memset(&conntrack_metadata, 0, sizeof(conntrack_metadata));
-		p.conntrack_metadata = conntrack_metadata;
-	#endif // ENABLE_CONNTRACK_METRICS
 
     #ifdef DATA_AGGREGATION_LEVEL
 
@@ -251,6 +241,9 @@ static void parse(struct __sk_buff *skb, __u8 obs)
 			p.previously_observed_packets = report.previously_observed_packets;
 			p.previously_observed_bytes = report.previously_observed_bytes;
 			p.previously_observed_flags = report.previously_observed_flags;
+			p.previously_observed_packets_reverse = report.previously_observed_packets_reverse;
+			p.previously_observed_bytes_reverse = report.previously_observed_bytes_reverse;
+			p.previously_observed_flags_reverse = report.previously_observed_flags_reverse;
 #ifdef USE_RING_BUFFER
 			bpf_ringbuf_output(&retina_packetparser_events, &p, sizeof(p), 0);
 #else

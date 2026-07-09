@@ -121,9 +121,15 @@ func (f *ForwardMetrics) ProcessFlow(flow *v1.Flow) {
 	labels := []string{
 		flow.TrafficDirection.String(),
 	}
+	// reverseLabels mirror labels with source/destination roles and direction
+	// swapped, so the opposite direction's counts (flushed on terminal delete)
+	// are attributed to the reply direction.
+	reverseLabels := []string{
+		reverseTrafficDirection(flow.TrafficDirection).String(),
+	}
 
 	if !f.isAdvanced() {
-		f.update(flow, labels)
+		f.update(flow, labels, reverseLabels)
 		return
 	}
 
@@ -131,6 +137,7 @@ func (f *ForwardMetrics) ProcessFlow(flow *v1.Flow) {
 		srcLabels := f.sourceCtx().getValues(flow)
 		if len(srcLabels) > 0 {
 			labels = append(labels, srcLabels...)
+			reverseLabels = append(reverseLabels, f.sourceCtx().getReverseValues(flow)...)
 		}
 	}
 
@@ -138,14 +145,16 @@ func (f *ForwardMetrics) ProcessFlow(flow *v1.Flow) {
 		dstLabel := f.destinationCtx().getValues(flow)
 		if len(dstLabel) > 0 {
 			labels = append(labels, dstLabel...)
+			reverseLabels = append(reverseLabels, f.destinationCtx().getReverseValues(flow)...)
 		}
 	}
 
 	if slices.Contains(f.additionalLabels(), utils.IsReply) {
 		labels = append(labels, strconv.FormatBool(flow.GetIsReply().GetValue()))
+		reverseLabels = append(reverseLabels, strconv.FormatBool(!flow.GetIsReply().GetValue()))
 	}
 
-	f.update(flow, labels)
+	f.update(flow, labels, reverseLabels)
 	f.getLogger().Debug("forward count metric is added", zap.Any("labels", labels))
 }
 
@@ -154,17 +163,21 @@ func (f *ForwardMetrics) processLocalCtxFlow(flow *v1.Flow) {
 	if labelValuesMap == nil {
 		return
 	}
-	// Ingress values.
+	// Ingress values: this pod is the destination in the forward direction, so its
+	// reverse-direction traffic is egress (same pod labels).
 	if len(labelValuesMap[ingress]) > 0 {
 		labels := append([]string{ingress}, labelValuesMap[ingress]...)
-		f.update(flow, labels)
+		reverseLabels := append([]string{egress}, labelValuesMap[ingress]...)
+		f.update(flow, labels, reverseLabels)
 		f.getLogger().Debug("forward count metric in INGRESS in local ctx", zap.Any("labels", labels))
 	}
 
-	// Egress values.
+	// Egress values: this pod is the source, so its reverse-direction traffic is
+	// ingress (same pod labels).
 	if len(labelValuesMap[egress]) > 0 {
 		labels := append([]string{egress}, labelValuesMap[egress]...)
-		f.update(flow, labels)
+		reverseLabels := append([]string{ingress}, labelValuesMap[egress]...)
+		f.update(flow, labels, reverseLabels)
 		f.getLogger().Debug("forward count metric in EGRESS in local ctx", zap.Any("labels", labels))
 	}
 }
@@ -180,15 +193,25 @@ func (f *ForwardMetrics) expire(labels []string) bool {
 	return d
 }
 
-func (f *ForwardMetrics) update(fl *v1.Flow, labels []string) {
+func (f *ForwardMetrics) update(fl *v1.Flow, labels, reverseLabels []string) {
 	var updated bool
 	switch f.metricName {
 	case utils.ForwardPacketsGaugeName:
 		updated = true
 		f.forwardMetric.WithLabelValues(labels...).Add(float64(utils.PreviouslyObservedPackets(fl) + 1))
+		// Opposite direction's packets flushed on terminal delete (no +1: there is
+		// no current packet in that direction), attributed to the reply direction.
+		if rev := utils.PreviouslyObservedPacketsReverse(fl); rev > 0 && reverseLabels != nil {
+			f.forwardMetric.WithLabelValues(reverseLabels...).Add(float64(rev))
+			f.updated(reverseLabels)
+		}
 	case utils.ForwardBytesGaugeName:
 		updated = true
 		f.forwardMetric.WithLabelValues(labels...).Add(float64(utils.PacketSize(fl) + utils.PreviouslyObservedBytes(fl)))
+		if rev := utils.PreviouslyObservedBytesReverse(fl); rev > 0 && reverseLabels != nil {
+			f.forwardMetric.WithLabelValues(reverseLabels...).Add(float64(rev))
+			f.updated(reverseLabels)
+		}
 	}
 	if updated {
 		f.updated(labels)

@@ -26,8 +26,13 @@ const (
 	ExtKeyPrevObservedPackets  = "previously_observed_packets"
 	ExtKeyPrevObservedBytes    = "previously_observed_bytes"
 	ExtKeyPrevObservedTCPFlags = "previously_observed_tcp_flags"
-	ExtKeySourceZone           = "source_zone"
-	ExtKeyDestinationZone      = "destination_zone"
+	// Reverse variants carry the opposite direction's unreported counts, flushed on
+	// terminal delete so bidirectional flows are not undercounted under sampling.
+	ExtKeyPrevObservedPacketsReverse  = "previously_observed_packets_reverse"
+	ExtKeyPrevObservedBytesReverse    = "previously_observed_bytes_reverse"
+	ExtKeyPrevObservedTCPFlagsReverse = "previously_observed_tcp_flags_reverse"
+	ExtKeySourceZone                  = "source_zone"
+	ExtKeyDestinationZone             = "destination_zone"
 
 	zoneUnknown = "unknown"
 )
@@ -269,6 +274,87 @@ func PreviouslyObservedPackets(f *flow.Flow) uint32 {
 		return 0
 	}
 	return uint32(v.GetNumberValue())
+}
+
+// AddPreviouslyObservedBytesReverse adds the opposite direction's unreported bytes
+// (flushed on terminal delete) to the flow's extensions.
+func AddPreviouslyObservedBytesReverse(s *structpb.Struct, bytes uint32) {
+	if s == nil || bytes == 0 {
+		return
+	}
+	s.GetFields()[ExtKeyPrevObservedBytesReverse] = structpb.NewNumberValue(float64(bytes))
+}
+
+func PreviouslyObservedBytesReverse(f *flow.Flow) uint32 {
+	s := GetExtensionsStruct(f)
+	if s == nil {
+		return 0
+	}
+	v, ok := s.GetFields()[ExtKeyPrevObservedBytesReverse]
+	if !ok {
+		return 0
+	}
+	return uint32(v.GetNumberValue())
+}
+
+// AddPreviouslyObservedPacketsReverse adds the opposite direction's unreported packets
+// (flushed on terminal delete) to the flow's extensions.
+func AddPreviouslyObservedPacketsReverse(s *structpb.Struct, packets uint32) {
+	if s == nil || packets == 0 {
+		return
+	}
+	s.GetFields()[ExtKeyPrevObservedPacketsReverse] = structpb.NewNumberValue(float64(packets))
+}
+
+func PreviouslyObservedPacketsReverse(f *flow.Flow) uint32 {
+	s := GetExtensionsStruct(f)
+	if s == nil {
+		return 0
+	}
+	v, ok := s.GetFields()[ExtKeyPrevObservedPacketsReverse]
+	if !ok {
+		return 0
+	}
+	return uint32(v.GetNumberValue())
+}
+
+// AddPreviouslyObservedTCPFlagsReverse adds the opposite direction's unreported TCP
+// flag counts (flushed on terminal delete) to the flow's extensions.
+func AddPreviouslyObservedTCPFlagsReverse(s *structpb.Struct, syn, ack, fin, rst, psh, urg, ece, cwr, ns uint32) {
+	if s == nil {
+		return
+	}
+	if syn == 0 && ack == 0 && fin == 0 && rst == 0 && psh == 0 && urg == 0 && ece == 0 && cwr == 0 && ns == 0 {
+		return
+	}
+	tcpFlags := &structpb.Struct{Fields: map[string]*structpb.Value{
+		SYN: structpb.NewNumberValue(float64(syn)),
+		ACK: structpb.NewNumberValue(float64(ack)),
+		FIN: structpb.NewNumberValue(float64(fin)),
+		RST: structpb.NewNumberValue(float64(rst)),
+		PSH: structpb.NewNumberValue(float64(psh)),
+		URG: structpb.NewNumberValue(float64(urg)),
+		ECE: structpb.NewNumberValue(float64(ece)),
+		CWR: structpb.NewNumberValue(float64(cwr)),
+		NS:  structpb.NewNumberValue(float64(ns)),
+	}}
+	s.GetFields()[ExtKeyPrevObservedTCPFlagsReverse] = structpb.NewStructValue(tcpFlags)
+}
+
+func PreviouslyObservedTCPFlagsReverse(f *flow.Flow) map[string]uint32 {
+	s := GetExtensionsStruct(f)
+	if s == nil {
+		return nil
+	}
+	v, ok := s.GetFields()[ExtKeyPrevObservedTCPFlagsReverse]
+	if !ok || v.GetStructValue() == nil {
+		return nil
+	}
+	result := make(map[string]uint32)
+	for k, val := range v.GetStructValue().GetFields() {
+		result[k] = uint32(val.GetNumberValue())
+	}
+	return result
 }
 
 func AddTCPFlagsBool(f *flow.Flow, syn, ack, fin, rst, psh, urg bool) {

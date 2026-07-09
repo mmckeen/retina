@@ -10,8 +10,6 @@
 #include "dynamic.h"
 
 struct tcpmetadata {
-	__u32 seq; // TCP sequence number
-	__u32 ack_num; // TCP ack number
 	__u32 tsval; // TCP timestamp value
 	__u32 tsecr; // TCP timestamp echo reply
 };
@@ -65,7 +63,9 @@ struct packet
     __u32 previously_observed_packets; // When sampling, this is the number of observed packets since the last report.
     __u32 previously_observed_bytes; // When sampling, this is the number of observed bytes since the last report.
     struct tcpflagscount previously_observed_flags; // When sampling, this is the previously observed TCP flags since the last report.
-    struct conntrackmetadata conntrack_metadata;
+    __u32 previously_observed_packets_reverse; // On terminal delete, the opposite direction's unreported packets.
+    __u32 previously_observed_bytes_reverse; // On terminal delete, the opposite direction's unreported bytes.
+    struct tcpflagscount previously_observed_flags_reverse; // On terminal delete, the opposite direction's unreported TCP flags.
 };
 
 /**
@@ -76,6 +76,9 @@ struct packetreport
     __u32 previously_observed_packets;
     __u32 previously_observed_bytes;
     struct tcpflagscount previously_observed_flags;
+    __u32 previously_observed_packets_reverse;
+    __u32 previously_observed_bytes_reverse;
+    struct tcpflagscount previously_observed_flags_reverse;
     bool report;
 };
 
@@ -272,8 +275,6 @@ static __always_inline bool _ct_create_new_tcp_connection(struct packet *p, stru
             new_value.conntrack_metadata.packets_tx_count = 1;
             new_value.conntrack_metadata.bytes_tx_count = p->bytes;
         }
-        // Update initial conntrack metadata for the connection.
-        __builtin_memcpy(&p->conntrack_metadata, &new_value.conntrack_metadata, sizeof(struct conntrackmetadata));
     #endif // ENABLE_CONNTRACK_METRICS
 
     // Update packet
@@ -310,9 +311,7 @@ static __always_inline bool _ct_handle_udp_connection(struct packet *p, struct c
     #ifdef ENABLE_CONNTRACK_METRICS
         new_value.conntrack_metadata.packets_tx_count = 1;
         new_value.conntrack_metadata.bytes_tx_count = p->bytes;
-        // Update packet's conntrack metadata.
-        __builtin_memcpy(&p->conntrack_metadata, &new_value.conntrack_metadata, sizeof(struct conntrackmetadata));;
-    #endif // ENABLE_CONNTRACK_METRICS    
+    #endif // ENABLE_CONNTRACK_METRICS
 
     // Update packet
     p->is_reply = false;
@@ -388,10 +387,6 @@ static __always_inline bool _ct_handle_tcp_connection(struct packet *p, struct c
         #endif // ENABLE_CONNTRACK_METRICS
         bpf_map_update_elem(&retina_conntrack, key, &new_value, BPF_ANY);
     }
-    #ifdef ENABLE_CONNTRACK_METRICS
-        // Update packet's conntrack metadata.
-        __builtin_memcpy(&p->conntrack_metadata, &new_value.conntrack_metadata, sizeof(struct conntrackmetadata));
-    #endif // ENABLE_CONNTRACK_METRICS
     return sampled;
 }
 
@@ -417,6 +412,27 @@ static __always_inline struct packetreport _ct_handle_new_connection(struct pack
         report.report = false; // We are not interested in other protocols.
     }
     return report;
+}
+
+/**
+ * Records the opposite direction's unreported byte/packet/flag counts into the report
+ * before a connection entry is deleted. Terminal events (timeout/final ACK/RST) flush
+ * only the terminating packet's direction; without this the opposite direction's
+ * since-last-report accumulators would be lost, undercounting bidirectional flows.
+ * @arg report The report to populate with the reverse-direction counts.
+ * @arg entry The connection tracking entry being removed.
+ * @arg direction The direction of the terminating packet.
+ */
+static __always_inline void _ct_fill_reverse(struct packetreport *report, struct ct_entry *entry, __u8 direction) {
+    if (direction == CT_PACKET_DIR_TX) {
+        report->previously_observed_bytes_reverse = READ_ONCE(entry->bytes_seen_since_last_report_rx_dir);
+        report->previously_observed_packets_reverse = READ_ONCE(entry->packets_seen_since_last_report_rx_dir);
+        __builtin_memcpy(&report->previously_observed_flags_reverse, &entry->flags_seen_since_last_report_rx_dir, sizeof(struct tcpflagscount));
+    } else {
+        report->previously_observed_bytes_reverse = READ_ONCE(entry->bytes_seen_since_last_report_tx_dir);
+        report->previously_observed_packets_reverse = READ_ONCE(entry->packets_seen_since_last_report_tx_dir);
+        __builtin_memcpy(&report->previously_observed_flags_reverse, &entry->flags_seen_since_last_report_tx_dir, sizeof(struct tcpflagscount));
+    }
 }
 
 /**
@@ -475,6 +491,7 @@ static __always_inline struct packetreport _ct_should_report_packet(struct ct_v4
 
     // Check if the connection timed out
     if (now >= eviction_time) {
+        _ct_fill_reverse(&report, entry, direction);
         bpf_map_delete_elem(&retina_conntrack, key);
         report.report = true;
         return report; // Report the last packet received before deletion
@@ -499,6 +516,7 @@ static __always_inline struct packetreport _ct_should_report_packet(struct ct_v4
             !(flags & (TCP_FIN | TCP_SYN | TCP_RST)) && 
             (entry->flags_seen_tx_dir & TCP_FIN) && 
             (entry->flags_seen_rx_dir & TCP_FIN)) {
+            _ct_fill_reverse(&report, entry, direction);
             bpf_map_delete_elem(&retina_conntrack, key);
             report.report = true;
             return report; // Report final ACK before connection removal
@@ -506,6 +524,7 @@ static __always_inline struct packetreport _ct_should_report_packet(struct ct_v4
 
         // If RST is seen, delete connection immediately
         if (flags & TCP_RST) {
+            _ct_fill_reverse(&report, entry, direction);
             bpf_map_delete_elem(&retina_conntrack, key);
             report.report = true;
             return report; // Report RST before connection removal
@@ -622,8 +641,6 @@ static __always_inline __attribute__((unused)) struct packetreport ct_process_pa
             // Update packet count and bytes count on conntrack entry.
             WRITE_ONCE(entry->conntrack_metadata.packets_tx_count, READ_ONCE(entry->conntrack_metadata.packets_tx_count) + 1);
             WRITE_ONCE(entry->conntrack_metadata.bytes_tx_count, READ_ONCE(entry->conntrack_metadata.bytes_tx_count) + p->bytes);
-            // Update packet's conntract metadata.
-            __builtin_memcpy(&p->conntrack_metadata, &entry->conntrack_metadata, sizeof(struct conntrackmetadata));
         #endif // ENABLE_CONNTRACK_METRICS
         return _ct_should_report_packet(&key, entry, p->flags, CT_PACKET_DIR_TX, p->bytes, sampled);
     }
@@ -644,8 +661,6 @@ static __always_inline __attribute__((unused)) struct packetreport ct_process_pa
             // Update packet count and bytes count on conntrack entry.
             WRITE_ONCE(entry->conntrack_metadata.packets_rx_count, READ_ONCE(entry->conntrack_metadata.packets_rx_count) + 1);
             WRITE_ONCE(entry->conntrack_metadata.bytes_rx_count, READ_ONCE(entry->conntrack_metadata.bytes_rx_count) + p->bytes);
-            // Update packet's conntract metadata.
-            __builtin_memcpy(&p->conntrack_metadata, &entry->conntrack_metadata, sizeof(struct conntrackmetadata));
         #endif // ENABLE_CONNTRACK_METRICS
         return _ct_should_report_packet(&reverse_key, entry, p->flags, CT_PACKET_DIR_RX, p->bytes, sampled);
     }

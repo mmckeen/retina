@@ -76,10 +76,8 @@ type packetparserPacket struct {
 	SrcPort     uint16
 	DstPort     uint16
 	TcpMetadata struct {
-		Seq    uint32
-		AckNum uint32
-		Tsval  uint32
-		Tsecr  uint32
+		Tsval uint32
+		Tsecr uint32
 	}
 	ObservationPoint          uint8
 	TrafficDirection          uint8
@@ -101,12 +99,18 @@ type packetparserPacket struct {
 		Cwr uint32
 		Ns  uint32
 	}
-	_                 [4]byte
-	ConntrackMetadata struct {
-		BytesTxCount   uint64
-		BytesRxCount   uint64
-		PacketsTxCount uint32
-		PacketsRxCount uint32
+	PreviouslyObservedPacketsReverse uint32
+	PreviouslyObservedBytesReverse   uint32
+	PreviouslyObservedFlagsReverse   struct {
+		Syn uint32
+		Ack uint32
+		Fin uint32
+		Rst uint32
+		Psh uint32
+		Urg uint32
+		Ece uint32
+		Cwr uint32
+		Ns  uint32
 	}
 }
 
