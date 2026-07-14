@@ -33,8 +33,8 @@ func main() {
 	ctxTimeout, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
 	// watcher manager
-	wm := watchermanager.NewWatcherManager(kcfg.DefaultFilterMapMaxEntries)
-	wm.Watchers = []watchermanager.IWatcher{endpoint.Watcher()}
+	wm := watchermanager.NewWatcherManager(kcfg.DefaultFilterMapMaxEntries, false, 0)
+	wm.Watchers = []watchermanager.IWatcher{endpoint.Watcher(false)}
 
 	err := wm.Start(ctxTimeout)
 	if err != nil {

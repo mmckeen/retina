@@ -245,6 +245,9 @@ func (d *Daemon) Start() error {
 	if daemonConfig.EnablePodLevel {
 		pubSub := pubsub.New()
 		controllerCache := controllercache.New(pubSub)
+		// This is the cache the k8s controllers below feed; serve pod/svc/node
+		// snapshots to late pubsub subscribers from it.
+		controllerCache.RegisterSnapshotSources()
 		enrich := enricher.New(ctx, controllerCache)
 		//nolint:govet // shadowing this err is fine
 		fm, err := filtermanager.Init(5, daemonConfig.FilterMapMaxEntries) //nolint:gomnd // defaults

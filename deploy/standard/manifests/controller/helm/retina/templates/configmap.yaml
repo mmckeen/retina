@@ -30,6 +30,8 @@ data:
     packetParserRingBuffer: {{ .Values.packetParserRingBuffer }}
     packetParserRingBufferSize: {{ .Values.packetParserRingBufferSize }}
     filterMapMaxEntries: {{ .Values.filterMapMaxEntries }}
+    enableEndpointNetlinkEvents: {{ .Values.enableEndpointNetlinkEvents }}
+    watcherRefreshInterval: {{ .Values.watcherRefreshInterval }}
 {{- end}}
 ---
 {{- if .Values.os.windows}}

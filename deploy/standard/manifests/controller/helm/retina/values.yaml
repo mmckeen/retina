@@ -72,6 +72,10 @@ packetParserRingBufferSize: 8388608
 # This map tracks IP addresses of pods of interest for network observability.
 # Default: 255. Increase for large clusters with many tracked pods.
 filterMapMaxEntries: 255
+# Attach eBPF programs on veth netlink events instead of waiting for the watcher refresh.
+enableEndpointNetlinkEvents: false
+# Watcher re-list interval.
+watcherRefreshInterval: "30s"
 
 imagePullSecrets: []
 nameOverride: "retina"

@@ -56,6 +56,18 @@ func (mr *MockPubSubInterfaceMockRecorder) Publish(arg0, arg1 any) *gomock.Call 
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Publish", reflect.TypeOf((*MockPubSubInterface)(nil).Publish), arg0, arg1)
 }
 
+// RegisterSource mocks base method.
+func (m *MockPubSubInterface) RegisterSource(arg0 PubSubTopic, arg1 func() []any) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "RegisterSource", arg0, arg1)
+}
+
+// RegisterSource indicates an expected call of RegisterSource.
+func (mr *MockPubSubInterfaceMockRecorder) RegisterSource(arg0, arg1 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RegisterSource", reflect.TypeOf((*MockPubSubInterface)(nil).RegisterSource), arg0, arg1)
+}
+
 // Subscribe mocks base method.
 func (m *MockPubSubInterface) Subscribe(arg0 PubSubTopic, arg1 *CallBackFunc) string {
 	m.ctrl.T.Helper()

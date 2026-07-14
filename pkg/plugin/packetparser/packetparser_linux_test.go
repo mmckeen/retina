@@ -18,6 +18,7 @@ import (
 
 	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	tc "github.com/florianl/go-tc"
 	nl "github.com/mdlayher/netlink"
@@ -79,6 +80,8 @@ func (mr *mockPerfReaderRecorder) Close() *gomock.Call {
 
 var errTestRead = errors.New("error")
 
+var errLinkDefunct = errors.New("link is defunct")
+
 var (
 	cfgPodLevelEnabled = &kcfg.Config{
 		EnablePodLevel:           true,
@@ -136,8 +139,8 @@ func TestCleanAll(t *testing.T) {
 		return mq
 	}
 
-	p.attachmentMap.Store(attachmentKey{"test", "test", 1}, &attachmentValue{tc: mrtnl, qdisc: &tc.Object{}})
-	p.attachmentMap.Store(attachmentKey{"test2", "test2", 2}, &attachmentValue{tc: mrtnl, qdisc: &tc.Object{}})
+	p.attachmentMap.Store(attachmentKey{1}, &attachmentValue{tc: mrtnl, qdisc: &tc.Object{}})
+	p.attachmentMap.Store(attachmentKey{2}, &attachmentValue{tc: mrtnl, qdisc: &tc.Object{}})
 
 	assert.Nil(t, p.cleanAll())
 
@@ -182,7 +185,7 @@ func TestClean(t *testing.T) {
 }
 
 func TestCleanWithErrors(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -209,7 +212,7 @@ func TestCleanWithErrors(t *testing.T) {
 }
 
 func TestEndpointWatcherCallbackFn_EndpointDeleted(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -229,9 +232,18 @@ func TestEndpointWatcherCallbackFn_EndpointDeleted(t *testing.T) {
 	}
 	key := ifaceToKey(linkAttr)
 
+	// The delete path must close only the stale socket — never delete the qdisc:
+	// a delete event means the interface is gone or its index was reused, so a
+	// clsact at this ifindex may belong to the new occupant. A strict qdisc mock
+	// with no expectations turns any Delete into a test failure.
+	mq := mocks.NewMockqdisc(ctrl)
+	getQdisc = func(nltc) qdisc { return mq }
+	oldRtnl := mocks.NewMocknltc(ctrl)
+	oldRtnl.EXPECT().Close().Return(nil).Times(1)
+
 	// Pre-populate both maps to simulate existing interface
 	p.interfaceLockMap.Store(key, &sync.Mutex{})
-	p.attachmentMap.Store(key, &attachmentValue{tc: nil, qdisc: &tc.Object{}})
+	p.attachmentMap.Store(key, &attachmentValue{tc: oldRtnl, qdisc: &tc.Object{}})
 
 	// Create EndpointDeleted event.
 	e := &endpoint.EndpointEvent{
@@ -251,7 +263,7 @@ func TestEndpointWatcherCallbackFn_EndpointDeleted(t *testing.T) {
 }
 
 func TestCreateQdiscAndAttach(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -281,7 +293,7 @@ func TestCreateQdiscAndAttach(t *testing.T) {
 		return 1
 	}
 
-	pObj := &packetparserObjects{} //nolint:typecheck
+	pObj := &packetparserObjects{} //nolint:typecheck // generated bpf2go type
 	pObj.EndpointIngressFilter = &ebpf.Program{}
 	pObj.EndpointEgressFilter = &ebpf.Program{}
 
@@ -308,6 +320,7 @@ func TestCreateQdiscAndAttach(t *testing.T) {
 		Name:         "test",
 		HardwareAddr: []byte("test"),
 		NetNsID:      1,
+		Index:        1,
 	}
 	// Test veth.
 	p.createQdiscAndAttach(linkAttr, Veth)
@@ -322,6 +335,7 @@ func TestCreateQdiscAndAttach(t *testing.T) {
 		Name:         "test2",
 		HardwareAddr: []byte("test2"),
 		NetNsID:      2,
+		Index:        2,
 	}
 	// Test Device.
 	p.createQdiscAndAttach(linkAttr2, Device)
@@ -331,8 +345,434 @@ func TestCreateQdiscAndAttach(t *testing.T) {
 	assert.True(t, ok)
 }
 
+// fakeTCXLink fakes a stored TCX link for the liveness check.
+type fakeTCXLink struct {
+	info   *link.Info
+	err    error
+	closed bool
+}
+
+func (f *fakeTCXLink) Info() (*link.Info, error) { return f.info, f.err }
+func (f *fakeTCXLink) Close() error              { f.closed = true; return nil }
+
+func TestTCXInfoAlive(t *testing.T) {
+	assert.True(t, tcxInfoAlive(nil), "indeterminate metadata must not churn attachments")
+	assert.True(t, tcxInfoAlive(&link.TCXInfo{Ifindex: 42}), "non-zero ifindex is a live attachment")
+	assert.False(t, tcxInfoAlive(&link.TCXInfo{Ifindex: 0}), "ifindex 0 marks a defunct link (interface deleted)")
+}
+
+// A live recorded attachment must short-circuit the re-assert: no re-attach, the
+// stored value untouched.
+func TestCreateQdiscAndAttachSkipsLiveAttachment(t *testing.T) {
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
+
+	linkAttr := netlink.LinkAttrs{Name: "live", Index: 100}
+	seeded := &attachmentValue{
+		attachmentType: attachmentTypeTCX,
+		tcxIngressLink: &fakeTCXLink{info: &link.Info{}}, // no TCX metadata -> treated alive
+		tcxEgressLink:  &fakeTCXLink{info: &link.Info{}},
+	}
+
+	p := &packetParser{
+		l:             log.Logger().Named("test"),
+		attachmentMap: &sync.Map{},
+	}
+	p.attachmentMap.Store(ifaceToKey(linkAttr), seeded)
+
+	p.createQdiscAndAttach(linkAttr, Veth)
+
+	got, ok := p.attachmentMap.Load(ifaceToKey(linkAttr))
+	assert.True(t, ok)
+	assert.Same(t, seeded, got.(*attachmentValue), "live attachment must be left untouched")
+}
+
+// A stale record (links dead in the kernel: interface deleted with its index
+// reused, or programs detached externally) must be dropped and the interface
+// re-attached, so the level-triggered re-assert self-heals it.
+func TestCreateQdiscAndAttachReplacesStaleAttachment(t *testing.T) {
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mfilter := mocks.NewMockfilter(ctrl)
+	mfilter.EXPECT().Add(gomock.Any()).Return(nil).AnyTimes()
+	mq := mocks.NewMockqdisc(ctrl)
+	mq.EXPECT().Add(gomock.Any()).Return(nil).AnyTimes()
+	mrtnl := mocks.NewMocknltc(ctrl)
+	mrtnl.EXPECT().Qdisc().Return(nil).AnyTimes()
+	mrtnl.EXPECT().SetOption(nl.ExtendedAcknowledge, true).Return(nil).AnyTimes()
+	getQdisc = func(nltc) qdisc { return mq }
+	getFilter = func(nltc) filter { return mfilter }
+	tcOpen = func(*tc.Config) (nltc, error) { return mrtnl, nil }
+	getFD = func(_ *ebpf.Program) int { return 1 }
+
+	pObj := &packetparserObjects{} //nolint:typecheck // generated bpf2go type
+	pObj.EndpointIngressFilter = &ebpf.Program{}
+	pObj.EndpointEgressFilter = &ebpf.Program{}
+
+	linkAttr := netlink.LinkAttrs{Name: "stale", Index: 200}
+	deadIngress := &fakeTCXLink{err: errLinkDefunct}
+	deadEgress := &fakeTCXLink{err: errLinkDefunct}
+	seeded := &attachmentValue{
+		attachmentType: attachmentTypeTCX,
+		tcxIngressLink: deadIngress,
+		tcxEgressLink:  deadEgress,
+	}
+
+	p := &packetParser{
+		cfg:                 cfgPodLevelEnabled,
+		l:                   log.Logger().Named("test"),
+		objs:                pObj,
+		interfaceLockMap:    &sync.Map{},
+		endpointIngressInfo: &ebpf.ProgramInfo{Name: "ingress"},
+		endpointEgressInfo:  &ebpf.ProgramInfo{Name: "egress"},
+		attachmentMap:       &sync.Map{},
+	}
+	p.attachmentMap.Store(ifaceToKey(linkAttr), seeded)
+
+	p.createQdiscAndAttach(linkAttr, Veth)
+
+	got, ok := p.attachmentMap.Load(ifaceToKey(linkAttr))
+	assert.True(t, ok, "interface must be re-attached after the stale record is dropped")
+	assert.NotSame(t, seeded, got.(*attachmentValue), "stale record must be replaced by a fresh attachment")
+	assert.True(t, deadIngress.closed && deadEgress.closed, "stale link handles must be closed")
+}
+
+// A live legacy-TC attachment (a bpf filter still present on the interface's
+// ingress hook) must be left untouched on re-assert — no re-attach, no churn.
+func TestCreateQdiscAndAttachSkipsLiveTCAttachment(t *testing.T) {
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	const idx = 300
+	mfilter := mocks.NewMockfilter(ctrl)
+	mfilter.EXPECT().Get(gomock.Any()).Return([]tc.Object{
+		{Attribute: tc.Attribute{Kind: "bpf"}},
+	}, nil).Times(1)
+	getFilter = func(nltc) filter { return mfilter }
+
+	linkAttr := netlink.LinkAttrs{Name: "tc-live", Index: idx}
+	seeded := &attachmentValue{
+		attachmentType: attachmentTypeTC,
+		tc:             mocks.NewMocknltc(ctrl),
+		qdisc:          &tc.Object{Msg: tc.Msg{Ifindex: idx}},
+	}
+
+	p := &packetParser{
+		l:             log.Logger().Named("test"),
+		attachmentMap: &sync.Map{},
+	}
+	p.attachmentMap.Store(ifaceToKey(linkAttr), seeded)
+
+	p.createQdiscAndAttach(linkAttr, Veth)
+
+	got, ok := p.attachmentMap.Load(ifaceToKey(linkAttr))
+	assert.True(t, ok)
+	assert.Same(t, seeded, got.(*attachmentValue), "live TC attachment must be left untouched")
+}
+
+// A dead legacy-TC attachment (no bpf filter — interface deleted, possibly
+// index reused — or an unusable probe socket) must be re-attached and the stale
+// rtnetlink socket released — WITHOUT deleting the clsact qdisc, which on index
+// reuse may belong to the interface's new occupant (no mq.Delete expectation:
+// any Delete call fails the test).
+func TestCreateQdiscAndAttachReplacesDeadTCAttachment(t *testing.T) {
+	cases := []struct {
+		name  string
+		probe func(msg *tc.Msg) ([]tc.Object, error)
+	}{
+		{"no filters", func(*tc.Msg) ([]tc.Object, error) { return nil, nil }},
+		{"probe error", func(*tc.Msg) ([]tc.Object, error) { return nil, errTestRead }},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			const idx = 302
+			mq := mocks.NewMockqdisc(ctrl)
+			// Add is the re-attach. No Delete expectation: the dead path must not
+			// delete a qdisc it cannot prove is ours.
+			mq.EXPECT().Add(gomock.Any()).Return(nil).Times(1)
+			getQdisc = func(nltc) qdisc { return mq }
+
+			mfilter := mocks.NewMockfilter(ctrl)
+			mfilter.EXPECT().Get(gomock.Any()).DoAndReturn(tt.probe).Times(1)
+			mfilter.EXPECT().Add(gomock.Any()).Return(nil).Times(2)
+			getFilter = func(nltc) filter { return mfilter }
+			getFD = func(_ *ebpf.Program) int { return 1 }
+
+			newRtnl := mocks.NewMocknltc(ctrl)
+			newRtnl.EXPECT().SetOption(nl.ExtendedAcknowledge, true).Return(nil).Times(1)
+			tcOpen = func(*tc.Config) (nltc, error) { return newRtnl, nil }
+
+			// The stale attachment's socket must be closed when we drop it.
+			oldRtnl := mocks.NewMocknltc(ctrl)
+			oldRtnl.EXPECT().Close().Return(nil).Times(1)
+
+			pObj := &packetparserObjects{} //nolint:typecheck // generated bpf2go type
+			pObj.EndpointIngressFilter = &ebpf.Program{}
+			pObj.EndpointEgressFilter = &ebpf.Program{}
+
+			linkAttr := netlink.LinkAttrs{Name: "tc-dead", Index: idx}
+			seeded := &attachmentValue{
+				attachmentType: attachmentTypeTC,
+				tc:             oldRtnl,
+				qdisc:          &tc.Object{Msg: tc.Msg{Ifindex: idx}},
+			}
+
+			p := &packetParser{
+				cfg:                 cfgPodLevelEnabled,
+				l:                   log.Logger().Named("test"),
+				objs:                pObj,
+				interfaceLockMap:    &sync.Map{},
+				endpointIngressInfo: &ebpf.ProgramInfo{Name: "ingress"},
+				endpointEgressInfo:  &ebpf.ProgramInfo{Name: "egress"},
+				attachmentMap:       &sync.Map{},
+			}
+			p.attachmentMap.Store(ifaceToKey(linkAttr), seeded)
+
+			p.createQdiscAndAttach(linkAttr, Veth)
+
+			got, ok := p.attachmentMap.Load(ifaceToKey(linkAttr))
+			assert.True(t, ok, "interface must be re-attached after the dead record is dropped")
+			assert.NotSame(t, seeded, got.(*attachmentValue), "dead record must be replaced by a fresh attachment")
+		})
+	}
+}
+
+// A non-fatal SetOption failure must not poison the cleanup path: the attach
+// still succeeds and must NOT be torn down afterwards (no qdisc Delete, no
+// socket Close — either call fails the test via missing expectations).
+func TestAttachViaTCSurvivesSetOptionFailure(t *testing.T) {
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mq := mocks.NewMockqdisc(ctrl)
+	mq.EXPECT().Add(gomock.Any()).Return(nil).Times(1)
+	getQdisc = func(nltc) qdisc { return mq }
+
+	mfilter := mocks.NewMockfilter(ctrl)
+	mfilter.EXPECT().Add(gomock.Any()).Return(nil).Times(2)
+	getFilter = func(nltc) filter { return mfilter }
+	getFD = func(_ *ebpf.Program) int { return 1 }
+
+	mrtnl := mocks.NewMocknltc(ctrl)
+	mrtnl.EXPECT().SetOption(nl.ExtendedAcknowledge, true).Return(errTestRead).Times(1)
+	tcOpen = func(*tc.Config) (nltc, error) { return mrtnl, nil }
+
+	pObj := &packetparserObjects{} //nolint:typecheck // generated bpf2go type
+	pObj.EndpointIngressFilter = &ebpf.Program{}
+	pObj.EndpointEgressFilter = &ebpf.Program{}
+
+	p := &packetParser{
+		cfg:                 cfgPodLevelEnabled,
+		l:                   log.Logger().Named("test"),
+		objs:                pObj,
+		endpointIngressInfo: &ebpf.ProgramInfo{Name: "ingress"},
+		endpointEgressInfo:  &ebpf.ProgramInfo{Name: "egress"},
+		attachmentMap:       &sync.Map{},
+	}
+
+	linkAttr := netlink.LinkAttrs{Name: "tc-optfail", Index: 310}
+	p.attachViaTC(linkAttr, Veth)
+
+	_, ok := p.attachmentMap.Load(ifaceToKey(linkAttr))
+	assert.True(t, ok, "attach must survive a non-fatal SetOption failure")
+}
+
+// A failed attach must release the rtnetlink socket — the failure returns
+// shadow err, so a defer keyed on err instead of an explicit flag never runs,
+// leaking one fd per failed attach, once per refresh under the re-assert. The
+// clsact qdisc is undone only if we created it: a pre-existing one may belong
+// to another agent (no Delete expectation in that case — a Delete call fails
+// the test).
+func TestAttachViaTCReleasesSocketOnFailedAttach(t *testing.T) {
+	cases := []struct {
+		name        string
+		qdiscAddErr error
+		wantDelete  bool
+	}{
+		{"qdisc created by us", nil, true},
+		{"qdisc pre-existing (possibly another agent's)", os.ErrExist, false},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			mq := mocks.NewMockqdisc(ctrl)
+			mq.EXPECT().Add(gomock.Any()).Return(tt.qdiscAddErr).Times(1)
+			if tt.wantDelete {
+				mq.EXPECT().Delete(gomock.Any()).Return(nil).Times(1) // undo our own qdisc
+			}
+			getQdisc = func(nltc) qdisc { return mq }
+
+			mfilter := mocks.NewMockfilter(ctrl)
+			mfilter.EXPECT().Add(gomock.Any()).Return(errTestRead).Times(1) // ingress add fails
+			getFilter = func(nltc) filter { return mfilter }
+			getFD = func(_ *ebpf.Program) int { return 1 }
+
+			mrtnl := mocks.NewMocknltc(ctrl)
+			mrtnl.EXPECT().SetOption(nl.ExtendedAcknowledge, true).Return(nil).Times(1)
+			mrtnl.EXPECT().Close().Return(nil).Times(1) // the fd must be released
+			tcOpen = func(*tc.Config) (nltc, error) { return mrtnl, nil }
+
+			pObj := &packetparserObjects{} //nolint:typecheck // generated bpf2go type
+			pObj.EndpointIngressFilter = &ebpf.Program{}
+			pObj.EndpointEgressFilter = &ebpf.Program{}
+
+			p := &packetParser{
+				cfg:                 cfgPodLevelEnabled,
+				l:                   log.Logger().Named("test"),
+				objs:                pObj,
+				endpointIngressInfo: &ebpf.ProgramInfo{Name: "ingress"},
+				endpointEgressInfo:  &ebpf.ProgramInfo{Name: "egress"},
+				attachmentMap:       &sync.Map{},
+			}
+
+			linkAttr := netlink.LinkAttrs{Name: "tc-addfail", Index: 311}
+			p.attachViaTC(linkAttr, Veth)
+
+			_, ok := p.attachmentMap.Load(ifaceToKey(linkAttr))
+			assert.False(t, ok, "failed attach must not be recorded")
+		})
+	}
+}
+
+// Stop must wait for a callback already past the stopping check: the cbMu
+// barrier holds teardown until the in-flight attach finishes, so its Store is
+// visible to cleanAll and the attachment is released rather than leaked.
+func TestStopWaitsForInFlightCallback(t *testing.T) {
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	mq := mocks.NewMockqdisc(ctrl)
+	mq.EXPECT().Add(gomock.Any()).DoAndReturn(func(*tc.Object) error {
+		close(entered)
+		<-release
+		return nil
+	}).Times(1)
+	mq.EXPECT().Delete(gomock.Any()).Return(nil).Times(1) // cleanAll releases the attachment
+	getQdisc = func(nltc) qdisc { return mq }
+
+	mfilter := mocks.NewMockfilter(ctrl)
+	mfilter.EXPECT().Add(gomock.Any()).Return(nil).Times(2)
+	getFilter = func(nltc) filter { return mfilter }
+	getFD = func(_ *ebpf.Program) int { return 1 }
+
+	mrtnl := mocks.NewMocknltc(ctrl)
+	mrtnl.EXPECT().SetOption(nl.ExtendedAcknowledge, true).Return(nil).Times(1)
+	mrtnl.EXPECT().Close().Return(nil).Times(1) // via cleanAll
+	tcOpen = func(*tc.Config) (nltc, error) { return mrtnl, nil }
+
+	pObj := &packetparserObjects{} //nolint:typecheck // generated bpf2go type
+	pObj.EndpointIngressFilter = &ebpf.Program{}
+	pObj.EndpointEgressFilter = &ebpf.Program{}
+
+	p := &packetParser{
+		cfg:                 cfgPodLevelEnabled,
+		l:                   log.Logger().Named("test"),
+		objs:                pObj,
+		interfaceLockMap:    &sync.Map{},
+		endpointIngressInfo: &ebpf.ProgramInfo{Name: "ingress"},
+		endpointEgressInfo:  &ebpf.ProgramInfo{Name: "egress"},
+		attachmentMap:       &sync.Map{},
+	}
+
+	// Deliver a create on a separate goroutine, as the pubsub drain goroutine would.
+	callbackDone := make(chan struct{})
+	go func() {
+		defer close(callbackDone)
+		p.endpointWatcherCallbackFn(endpoint.NewEndpointEvent(endpoint.EndpointCreated,
+			netlink.LinkAttrs{Name: "in-flight", Index: 330}))
+	}()
+	<-entered // callback is now mid-attach, inside cbMu
+	// The callback captured the program pointers before blocking; drop objs so
+	// Stop doesn't Close zero-value bpf2go objects (ordered by the entered chan).
+	p.objs = nil
+
+	stopDone := make(chan struct{})
+	go func() {
+		defer close(stopDone)
+		_ = p.Stop()
+	}()
+
+	select {
+	case <-stopDone:
+		t.Fatal("Stop returned while a callback was still in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	<-callbackDone
+	select {
+	case <-stopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not complete after the in-flight callback finished")
+	}
+
+	// cleanAll must have observed the Store (mock expectations above) and reset the map.
+	count := 0
+	p.attachmentMap.Range(func(_, _ interface{}) bool { count++; return true })
+	assert.Zero(t, count, "the in-flight attachment must be cleaned by Stop, not leaked")
+}
+
+// After Stop, an endpoint delivery still in flight (pubsub does not join it)
+// must be a no-op. The parser's maps are nil here, so a broken guard panics.
+func TestStopQuiescesEndpointCallback(t *testing.T) {
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
+
+	p := &packetParser{l: log.Logger().Named("test")}
+	require.NoError(t, p.Stop())
+
+	ev := endpoint.NewEndpointEvent(endpoint.EndpointCreated, netlink.LinkAttrs{Name: "late", Index: 320})
+	assert.NotPanics(t, func() { p.endpointWatcherCallbackFn(ev) },
+		"a delivery after Stop must be dropped by the stopping guard")
+}
+
+// The delete callback must detach a TCX attachment via cleanTCX (closing both
+// links) and drop the map entry — the TCX counterpart of the TC clean path.
+func TestEndpointWatcherCallbackFn_EndpointDeletedTCX(t *testing.T) {
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
+
+	p := &packetParser{
+		cfg:              cfgPodLevelEnabled,
+		l:                log.Logger().Named("test"),
+		interfaceLockMap: &sync.Map{},
+		attachmentMap:    &sync.Map{},
+	}
+	linkAttr := netlink.LinkAttrs{Name: "tcx-del", Index: 301}
+	key := ifaceToKey(linkAttr)
+	ingress := &fakeTCXLink{info: &link.Info{}}
+	egress := &fakeTCXLink{info: &link.Info{}}
+	p.interfaceLockMap.Store(key, &sync.Mutex{})
+	p.attachmentMap.Store(key, &attachmentValue{
+		attachmentType: attachmentTypeTCX,
+		tcxIngressLink: ingress,
+		tcxEgressLink:  egress,
+	})
+
+	p.endpointWatcherCallbackFn(&endpoint.EndpointEvent{Type: endpoint.EndpointDeleted, Obj: linkAttr})
+
+	_, ok := p.attachmentMap.Load(key)
+	assert.False(t, ok, "attachmentMap entry should be deleted")
+	assert.True(t, ingress.closed && egress.closed, "TCX links should be closed on delete")
+	_, lockOK := p.interfaceLockMap.Load(key)
+	assert.False(t, lockOK, "interfaceLockMap entry should be deleted")
+}
+
 func TestReadData_Error(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -376,7 +816,7 @@ func TestReadData_RingBufClosed(t *testing.T) {
 }
 
 func TestReadDataPodLevelEnabled(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -434,7 +874,7 @@ func TestReadDataPodLevelEnabled(t *testing.T) {
 }
 
 func TestStartPodLevelDisabled(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	p := &packetParser{
 		cfg: cfgPodLevelDisabled,
 		l:   log.Logger().Named("test"),
@@ -604,7 +1044,7 @@ func TestStartWithDataAggregationLevelHigh(t *testing.T) {
 }
 
 func TestInitPodLevelDisabled(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	p := &packetParser{
 		cfg: cfgPodLevelDisabled,
 		l:   log.Logger().Named("test"),
@@ -617,7 +1057,7 @@ func TestPacketParseGenerate(t *testing.T) {
 	takeBackup()
 	defer restoreBackup()
 
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	// Get the directory of the current test file.
 	_, filename, _, ok := runtime.Caller(0)
 	if !ok {
@@ -696,7 +1136,7 @@ func TestCompile(t *testing.T) {
 	takeBackup()
 	defer restoreBackup()
 
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	p := &packetParser{
 		cfg: cfgPodLevelEnabled,
 		l:   log.Logger().Named(name),

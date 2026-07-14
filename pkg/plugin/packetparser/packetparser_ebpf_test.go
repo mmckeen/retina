@@ -7,24 +7,29 @@ package packetparser
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
 	"github.com/cilium/ebpf/ringbuf"
+	tc "github.com/florianl/go-tc"
 	"github.com/gopacket/gopacket/layers"
 	"github.com/microsoft/retina/pkg/loader"
 	"github.com/microsoft/retina/pkg/log"
 	"github.com/microsoft/retina/pkg/plugin/ebpftest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/vishvananda/netlink"
 )
 
 const (
@@ -51,7 +56,7 @@ const (
 )
 
 // loadTestObjects loads the packetparser eBPF programs and maps for testing.
-func loadTestObjects(t *testing.T) (*packetparserObjects, *perf.Reader) {
+func loadTestObjects(t testing.TB) (*packetparserObjects, *perf.Reader) {
 	t.Helper()
 	ebpftest.RequirePrivileged(t)
 
@@ -1298,4 +1303,260 @@ func TestRingBufReaderWrapper(t *testing.T) {
 	// After closing, Read() should return ringbuf.ErrClosed
 	_, err = wrapper.Read()
 	assert.ErrorIs(t, err, ringbuf.ErrClosed)
+}
+
+// TestTCXLinkLivenessAcrossInterfaceDelete verifies the attachment liveness
+// probe against a real kernel: a TCX link on a live veth reports its interface
+// index, and reports Ifindex 0 (defunct) once the veth is deleted — the signal
+// createQdiscAndAttach uses to drop a stale attachment record and re-attach when
+// an interface index is reused. Requires kernel 6.6+ (TCX) and NET_ADMIN.
+func TestTCXLinkLivenessAcrossInterfaceDelete(t *testing.T) {
+	objs, _ := loadTestObjects(t)
+
+	la := netlink.NewLinkAttrs()
+	la.Name = "rtnlive0"
+	veth := &netlink.Veth{LinkAttrs: la, PeerName: "rtnlive0p"}
+	// Remove any leftover from a previously failed run.
+	if old, err := netlink.LinkByName(la.Name); err == nil {
+		_ = netlink.LinkDel(old)
+	}
+	require.NoError(t, netlink.LinkAdd(veth))
+	deleted := false
+	t.Cleanup(func() {
+		if !deleted {
+			_ = netlink.LinkDel(veth)
+		}
+	})
+
+	created, err := netlink.LinkByName(la.Name)
+	require.NoError(t, err)
+	idx := created.Attrs().Index
+
+	tcx, err := link.AttachTCX(link.TCXOptions{
+		Program:   objs.EndpointIngressFilter,
+		Attach:    ebpf.AttachTCXIngress,
+		Interface: idx,
+		Anchor:    link.Head(),
+	})
+	if errors.Is(err, ebpf.ErrNotSupported) {
+		t.Skipf("TCX not supported on this kernel: %v", err)
+	}
+	require.NoError(t, err)
+	t.Cleanup(func() { tcx.Close() })
+
+	// Alive: the probe sees the real interface index.
+	info, err := tcx.Info()
+	require.NoError(t, err)
+	tcxInfo := info.TCX()
+	require.NotNil(t, tcxInfo, "expected TCX metadata on a TCX link")
+	assert.Equal(t, uint32(idx), tcxInfo.Ifindex, "live link must report its interface index")
+	assert.True(t, tcxLinkAlive(tcx), "link on a live interface must probe alive")
+
+	// Delete the interface: the kernel auto-detaches, and the surviving link
+	// handle must probe defunct.
+	require.NoError(t, netlink.LinkDel(veth))
+	deleted = true
+
+	assert.Eventually(t, func() bool { return !tcxLinkAlive(tcx) },
+		2*time.Second, 10*time.Millisecond,
+		"link must probe dead after its interface is deleted")
+}
+
+// TestCreateQdiscAndAttachTC exercises the real legacy-TC path
+// (createQdiscAndAttach -> attachViaTC -> go-tc clsact qdisc + BPF filters) and
+// the real tcAttachmentAlive probe against a live kernel. Requires NET_ADMIN.
+func TestCreateQdiscAndAttachTC(t *testing.T) {
+	objs, _ := loadTestObjects(t)
+
+	// This binary (-tags=ebpf) also compiles the unit tests, which mutate these
+	// package-var seams to gomock fakes without restoring them. Reset them to the
+	// real implementations so this test drives the actual kernel, regardless of
+	// test execution order.
+	getQdisc = func(tcnl nltc) qdisc { return tcnl.Qdisc() }
+	getFilter = func(tcnl nltc) filter { return tcnl.Filter() }
+	tcOpen = func(config *tc.Config) (nltc, error) { return tc.Open(config) }
+	getFD = func(e *ebpf.Program) int { return e.FD() }
+
+	la := netlink.NewLinkAttrs()
+	la.Name = "rtntcatt"
+	veth := &netlink.Veth{LinkAttrs: la, PeerName: "rtntcattp"}
+	if old, err := netlink.LinkByName(la.Name); err == nil {
+		_ = netlink.LinkDel(old)
+	}
+	require.NoError(t, netlink.LinkAdd(veth))
+	deleted := false
+	t.Cleanup(func() {
+		if !deleted {
+			_ = netlink.LinkDel(veth)
+		}
+	})
+
+	created, err := netlink.LinkByName(la.Name)
+	require.NoError(t, err)
+	attrs := *created.Attrs()
+
+	p := &packetParser{
+		l:                   log.Logger().Named("test"),
+		objs:                objs,
+		attachmentMap:       &sync.Map{},
+		endpointIngressInfo: &ebpf.ProgramInfo{Name: "endpoint_ingress"},
+		endpointEgressInfo:  &ebpf.ProgramInfo{Name: "endpoint_egress"},
+		tcxSupported:        false, // force the legacy TC path
+	}
+	t.Cleanup(func() { _ = p.cleanAll() })
+
+	p.createQdiscAndAttach(attrs, Veth)
+
+	value, ok := p.attachmentMap.Load(ifaceToKey(attrs))
+	require.True(t, ok, "expected a recorded attachment after TC attach")
+	av := value.(*attachmentValue)
+	require.Equal(t, attachmentTypeTC, av.attachmentType, "should attach via legacy TC when TCX is disabled")
+	assert.True(t, p.attachmentAlive(av), "freshly attached clsact qdisc must probe alive")
+
+	// A re-assert while live must be a no-op (idempotent skip).
+	p.createQdiscAndAttach(attrs, Veth)
+	value2, _ := p.attachmentMap.Load(ifaceToKey(attrs))
+	assert.Same(t, av, value2.(*attachmentValue), "live re-assert must not re-attach")
+
+	// Delete the interface: the kernel removes the clsact qdisc, so the probe
+	// must report the attachment dead.
+	require.NoError(t, netlink.LinkDel(veth))
+	deleted = true
+	assert.Eventually(t, func() bool { return !p.attachmentAlive(av) },
+		2*time.Second, 10*time.Millisecond,
+		"attachment must probe dead after its interface (and clsact qdisc) is deleted")
+}
+
+// BenchmarkTCLivenessProbe measures the cost of a single legacy-TC liveness
+// probe (attachmentAlive -> a targeted per-ifindex filter query on the clsact
+// ingress hook) as the number of attached interfaces grows. Flat ns/op across N
+// shows the per-probe cost is O(1), keeping a full re-assert sweep over N
+// attachments at O(N) — a system-wide qdisc dump here would make the sweep
+// O(N^2). It is not run by CI (needs -bench and NET_ADMIN); run on a privileged
+// host with:
+//
+//	go test -tags=ebpf -run='^$' -bench=BenchmarkTCLivenessProbe ./pkg/plugin/packetparser/
+//
+// TCX's probe is one per-link Info() syscall, also O(1) (see its benchmark).
+func BenchmarkTCLivenessProbe(b *testing.B) {
+	objs, _ := loadTestObjects(b)
+
+	// -tags=ebpf also compiles the mock-mutating unit tests; use the real impls.
+	getQdisc = func(tcnl nltc) qdisc { return tcnl.Qdisc() }
+	getFilter = func(tcnl nltc) filter { return tcnl.Filter() }
+	tcOpen = func(config *tc.Config) (nltc, error) { return tc.Open(config) }
+	getFD = func(e *ebpf.Program) int { return e.FD() }
+
+	for _, n := range []int{50, 100, 200} {
+		b.Run(fmt.Sprintf("N=%d", n), func(b *testing.B) {
+			p := &packetParser{
+				l:                   log.Logger().Named("bench"),
+				objs:                objs,
+				attachmentMap:       &sync.Map{},
+				endpointIngressInfo: &ebpf.ProgramInfo{Name: "endpoint_ingress"},
+				endpointEgressInfo:  &ebpf.ProgramInfo{Name: "endpoint_egress"},
+				tcxSupported:        false, // force legacy TC
+			}
+			var veths []*netlink.Veth
+			b.Cleanup(func() {
+				_ = p.cleanAll()
+				for _, v := range veths {
+					_ = netlink.LinkDel(v)
+				}
+			})
+
+			// Setup (untimed): create and attach N veths via the real TC path.
+			var probeKey attachmentKey
+			for i := 0; i < n; i++ {
+				la := netlink.NewLinkAttrs()
+				la.Name = fmt.Sprintf("rtnbench%d", i)
+				veth := &netlink.Veth{LinkAttrs: la, PeerName: fmt.Sprintf("rtnbenchp%d", i)}
+				if old, err := netlink.LinkByName(la.Name); err == nil {
+					_ = netlink.LinkDel(old)
+				}
+				require.NoError(b, netlink.LinkAdd(veth))
+				veths = append(veths, veth)
+				created, err := netlink.LinkByName(la.Name)
+				require.NoError(b, err)
+				attrs := *created.Attrs()
+				p.createQdiscAndAttach(attrs, Veth)
+				probeKey = ifaceToKey(attrs)
+			}
+			val, ok := p.attachmentMap.Load(probeKey)
+			require.True(b, ok, "expected an attachment to probe")
+			av := val.(*attachmentValue)
+
+			// Timed: one liveness probe per iteration. b.Loop keeps the setup
+			// above out of the measured region and runs it only once.
+			for b.Loop() {
+				if !p.attachmentAlive(av) {
+					b.Fatal("attachment should probe alive")
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkTCXLivenessProbe is the TCX counterpart of BenchmarkTCLivenessProbe.
+// A TCX probe is a single per-link Info() syscall, so ns/op should stay flat as
+// N grows. Both transports now probe O(1); TCX remains cheaper (no netlink
+// round-trips). Requires kernel 6.6+ (TCX) and NET_ADMIN.
+// Run alongside the TC benchmark:
+//
+//	go test -tags=ebpf -run='^$' -bench='BenchmarkTC.*LivenessProbe' ./pkg/plugin/packetparser/
+func BenchmarkTCXLivenessProbe(b *testing.B) {
+	objs, _ := loadTestObjects(b)
+	if !isTCXSupported() {
+		b.Skip("TCX not supported on this kernel")
+	}
+	// The TCX path uses link.AttachTCX directly and none of the mutable TC seams,
+	// so no reset is needed here.
+
+	for _, n := range []int{50, 100, 200} {
+		b.Run(fmt.Sprintf("N=%d", n), func(b *testing.B) {
+			p := &packetParser{
+				l:                   log.Logger().Named("bench"),
+				objs:                objs,
+				attachmentMap:       &sync.Map{},
+				endpointIngressInfo: &ebpf.ProgramInfo{Name: "endpoint_ingress"},
+				endpointEgressInfo:  &ebpf.ProgramInfo{Name: "endpoint_egress"},
+				tcxSupported:        true, // force TCX
+			}
+			var veths []*netlink.Veth
+			b.Cleanup(func() {
+				_ = p.cleanAll()
+				for _, v := range veths {
+					_ = netlink.LinkDel(v)
+				}
+			})
+
+			// Setup (untimed): create and attach N veths via the real TCX path.
+			var probeKey attachmentKey
+			for i := 0; i < n; i++ {
+				la := netlink.NewLinkAttrs()
+				la.Name = fmt.Sprintf("rtnxbench%d", i)
+				veth := &netlink.Veth{LinkAttrs: la, PeerName: fmt.Sprintf("rtnxbenchp%d", i)}
+				if old, err := netlink.LinkByName(la.Name); err == nil {
+					_ = netlink.LinkDel(old)
+				}
+				require.NoError(b, netlink.LinkAdd(veth))
+				veths = append(veths, veth)
+				created, err := netlink.LinkByName(la.Name)
+				require.NoError(b, err)
+				attrs := *created.Attrs()
+				p.createQdiscAndAttach(attrs, Veth)
+				probeKey = ifaceToKey(attrs)
+			}
+			val, ok := p.attachmentMap.Load(probeKey)
+			require.True(b, ok, "expected an attachment to probe")
+			av := val.(*attachmentValue)
+			require.Equal(b, attachmentTypeTCX, av.attachmentType, "setup must use the TCX path")
+
+			for b.Loop() {
+				if !p.attachmentAlive(av) {
+					b.Fatal("attachment should probe alive")
+				}
+			}
+		})
+	}
 }

@@ -22,9 +22,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// RequirePrivileged skips the test if the current process lacks BPF privileges.
-// It checks for CAP_BPF or CAP_SYS_ADMIN in the effective capability set.
-func RequirePrivileged(t *testing.T) {
+// RequirePrivileged skips the test/benchmark if the current process lacks BPF
+// privileges. It checks for CAP_BPF or CAP_SYS_ADMIN in the effective capability set.
+func RequirePrivileged(t testing.TB) {
 	t.Helper()
 
 	if os.Geteuid() == 0 {

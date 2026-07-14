@@ -6,12 +6,14 @@ on:
       - 'pkg/plugin/**/_cprog/**'
       - 'pkg/plugin/**/*_ebpf_test.go'
       - 'pkg/plugin/ebpftest/**'
+      - 'pkg/watchers/**'
   pull_request:
     branches: [main]
     paths:
       - 'pkg/plugin/**/_cprog/**'
       - 'pkg/plugin/**/*_ebpf_test.go'
       - 'pkg/plugin/ebpftest/**'
+      - 'pkg/watchers/**'
   workflow_dispatch:
 
 permissions:
@@ -46,4 +48,4 @@ jobs:
 
       - name: Run eBPF program tests
         run: |
-          sudo $(which go) test -tags=ebpf -v -count=1 ./pkg/plugin/...
+          sudo $(which go) test -tags=ebpf -v -count=1 ./pkg/plugin/... ./pkg/watchers/...

@@ -341,6 +341,7 @@ func (p *packetParser) Start(ctx context.Context) error {
 	}
 
 	p.l.Info("Starting packet parser")
+	p.stopping.Store(false) // may be set from a prior Stop on this instance
 
 	p.l.Info("setting up enricher since pod level is enabled")
 	// Set up enricher.
@@ -396,6 +397,23 @@ func (p *packetParser) Stop() error {
 	// Get pubsubs instance
 	ps := pubsub.New()
 
+	// Quiesce the endpoint callback FIRST: mark stopping (deliveries become
+	// no-ops), unsubscribe, then wait out any delivery already in flight —
+	// pubsub's Unsubscribe does not wait for one. Only then is it safe to close
+	// programs and clean attachments; tearing down first would let an in-flight
+	// attach use closed programs or Store after cleanAll, leaking a live link.
+	p.stopping.Store(true)
+	if p.callbackID != "" {
+		if err := ps.Unsubscribe(common.PubSubEndpoints, p.callbackID); err != nil {
+			p.l.Error("Error unregistering callback for packetParser", zap.Error(err))
+		}
+		// Reset callback ID.
+		p.callbackID = ""
+	}
+	p.cbMu.Lock()
+	p.cbMu.Unlock() //nolint:staticcheck,gocritic // empty critical section is the point: a barrier for an in-flight callback
+	p.l.Debug("Quiesced endpoint callback")
+
 	// Stop perf reader.
 	if p.reader != nil {
 		if err := p.reader.Close(); err != nil {
@@ -419,15 +437,6 @@ func (p *packetParser) Stop() error {
 	}
 	p.l.Debug("Stopped map/progs")
 
-	// Unregister callback.
-	if p.callbackID != "" {
-		if err := ps.Unsubscribe(common.PubSubEndpoints, p.callbackID); err != nil {
-			p.l.Error("Error unregistering callback for packetParser", zap.Error(err))
-		}
-		// Reset callback ID.
-		p.callbackID = ""
-	}
-
 	if err := p.cleanAll(); err != nil {
 		p.l.Error("Error cleaning", zap.Error(err))
 		return err
@@ -444,6 +453,10 @@ func (p *packetParser) SetupChannel(ch chan *v1.Event) error {
 
 // cleanAll is NOT thread safe.
 // Not required for now.
+// Accepted gap (legacy TC only): the qdisc delete is unconditional, so if an
+// attach rode on a clsact another agent created (ErrExist-tolerated), stopping
+// Retina removes that agent's filters too. TCX teardown closes only our own
+// links.
 func (p *packetParser) cleanAll() error {
 	if p.attachmentMap == nil {
 		return nil
@@ -471,7 +484,7 @@ func (p *packetParser) clean(rtnl nltc, qdisc *tc.Object) {
 	// Warning, not error. Clean is best effort.
 	if rtnl != nil {
 		if err := getQdisc(rtnl).Delete(qdisc); err != nil && !errors.Is(err, tc.ErrNoArg) {
-			p.l.Debug("could not delete egress qdisc", zap.Error(err))
+			p.l.Debug("could not delete clsact qdisc", zap.Error(err))
 		}
 		if err := rtnl.Close(); err != nil {
 			p.l.Warn("could not close rtnetlink socket", zap.Error(err))
@@ -479,8 +492,85 @@ func (p *packetParser) clean(rtnl nltc, qdisc *tc.Object) {
 	}
 }
 
+// attachmentAlive reports whether a recorded attachment still exists in the
+// kernel. Both transports are probed at the same granularity (interface-level):
+// TCX via the link's Ifindex, legacy TC via the presence of a bpf filter on
+// the clsact ingress hook.
+// The kernel tears both down when the interface is deleted, so a probe that
+// comes back dead means the record is stale (interface gone, possibly with its
+// index already reused) and must be re-attached.
+func (p *packetParser) attachmentAlive(v *attachmentValue) bool {
+	if v.attachmentType == attachmentTypeTCX {
+		return tcxLinkAlive(v.tcxIngressLink) && tcxLinkAlive(v.tcxEgressLink)
+	}
+	return p.tcAttachmentAlive(v)
+}
+
+// tcAttachmentAlive reports whether a BPF filter still exists on the recorded
+// interface's clsact ingress hook. It queries only that interface+parent (O(1)),
+// rather than dumping every qdisc system-wide, so a re-assert sweep over N
+// attachments stays O(N) instead of O(N^2). The kernel removes the clsact qdisc
+// and its filters when the interface is deleted, so the filter's absence means
+// the attachment is defunct. A probe error (e.g. the socket is unusable) is
+// treated as dead so we re-attach rather than trust a stale record.
+//
+// The probe matches on presence (any bpf filter), deliberately no stronger:
+// the repair path is an EEXIST-tolerant Add, which can only fix "no filter
+// there" — a probe that detects more than Add can repair (e.g. matching our
+// program ID) turns unrepairable states into per-refresh re-attach churn that
+// accumulates duplicate auto-handle filters. Accepted, documented gaps of the
+// legacy-TC fallback, all absent under TCX:
+//   - unclean agent restart: the surviving filters satisfy the probe; the
+//     first re-attach leaves one duplicate ingress filter and the egress hook
+//     keeps the dead process's program until the veth churns.
+//   - index reuse where the new occupant carries another agent's bpf filter:
+//     probes false-alive, so that veth stays unmonitored until it churns.
+//   - another legacy-TC agent on the same hooks contends for the conventional
+//     (prio 1) slots.
+func (p *packetParser) tcAttachmentAlive(v *attachmentValue) bool {
+	if v.tc == nil || v.qdisc == nil {
+		return false
+	}
+	filters, err := getFilter(v.tc).Get(&tc.Msg{
+		Family:  unix.AF_UNSPEC,
+		Ifindex: v.qdisc.Ifindex,
+		Parent:  helper.BuildHandle(0xFFFF, tc.HandleMinIngress), //nolint:gomnd // clsact ingress parent, matches attachViaTC
+	})
+	if err != nil {
+		p.l.Debug("could not query filters for TC liveness probe", zap.Error(err))
+		return false
+	}
+	for i := range filters {
+		if filters[i].Kind == "bpf" {
+			return true
+		}
+	}
+	return false
+}
+
+// tcxLinkAlive reports whether a TCX link is still attached to a live
+// interface. The kernel auto-detaches TCX links when their interface is
+// deleted; the surviving defunct link reports Ifindex 0.
+func tcxLinkAlive(l tcxLink) bool {
+	if l == nil {
+		return false
+	}
+	info, err := l.Info()
+	if err != nil {
+		return false
+	}
+	return tcxInfoAlive(info.TCX())
+}
+
+// tcxInfoAlive is the liveness decision on a link's TCX metadata: Ifindex 0
+// means the kernel cleared the device (interface deleted). Nil metadata means
+// liveness cannot be determined; treat as alive rather than churn attachments.
+func tcxInfoAlive(tcx *link.TCXInfo) bool {
+	return tcx == nil || tcx.Ifindex != 0
+}
+
 // cleanTCX closes TCX links. This is best effort.
-func (p *packetParser) cleanTCX(ingressLink, egressLink link.Link) {
+func (p *packetParser) cleanTCX(ingressLink, egressLink tcxLink) {
 	if ingressLink != nil {
 		if err := ingressLink.Close(); err != nil {
 			p.l.Debug("could not close ingress TCX link", zap.Error(err))
@@ -529,6 +619,15 @@ func isTCXSupported() bool {
 }
 
 func (p *packetParser) endpointWatcherCallbackFn(obj interface{}) {
+	// Serialize with Stop: a delivery already in flight when Stop unsubscribes
+	// must finish (or become a no-op) before Stop tears down programs and maps,
+	// otherwise a racing attach can Store after cleanAll and leak a live link.
+	p.cbMu.Lock()
+	defer p.cbMu.Unlock()
+	if p.stopping.Load() {
+		return
+	}
+
 	// Contract is that we will receive an endpoint event pointer.
 	event := obj.(*endpoint.EndpointEvent)
 	if event == nil {
@@ -554,8 +653,15 @@ func (p *packetParser) endpointWatcherCallbackFn(obj interface{}) {
 			v := value.(*attachmentValue)
 			if v.attachmentType == attachmentTypeTCX {
 				p.cleanTCX(v.tcxIngressLink, v.tcxEgressLink)
-			} else {
-				p.clean(v.tc, v.qdisc)
+			} else if v.tc != nil {
+				// Close only the socket — do NOT delete the qdisc. A delete event
+				// means the interface is gone (the kernel already destroyed our
+				// qdisc) or its index was reused (the watcher's reuse detection
+				// publishes a delete for a live index): a clsact present at this
+				// ifindex belongs to the new occupant, possibly another agent.
+				if err := v.tc.Close(); err != nil {
+					p.l.Warn("could not close rtnetlink socket", zap.Error(err))
+				}
 			}
 			// Delete from map.
 			p.attachmentMap.Delete(ifaceKey)
@@ -572,6 +678,35 @@ func (p *packetParser) endpointWatcherCallbackFn(obj interface{}) {
 // depending on kernel support and configuration.
 // Only support interfaces of type veth and device.
 func (p *packetParser) createQdiscAndAttach(iface netlink.LinkAttrs, ifaceType interfaceType) {
+	// Idempotent: skip if already attached so repeated reconcile events don't
+	// double-attach and leak links. Presence alone isn't enough: verify the
+	// recorded attachment is still live in the kernel. A record can outlive its
+	// attachment — the interface was deleted and its index reused before we saw
+	// the delete, or the programs were detached externally — and trusting it
+	// would leave the current occupant unmonitored until it next churns. The
+	// level-triggered re-assert redelivers creates every refresh, so dropping a
+	// stale record here self-heals within one refresh interval.
+	if value, ok := p.attachmentMap.Load(ifaceToKey(iface)); ok {
+		v := value.(*attachmentValue)
+		if p.attachmentAlive(v) {
+			return
+		}
+		p.l.Warn("stale attachment record; re-attaching",
+			zap.String("interface", iface.Name), zap.Int("index", iface.Index))
+		// Best effort: release the defunct handles before re-attaching so we don't
+		// leak the TCX links or the TC rtnetlink socket. For TC, close only the
+		// socket — do NOT delete the qdisc: on index reuse the clsact at this
+		// ifindex may belong to the interface's new occupant (another agent), and
+		// attachViaTC tolerates an existing qdisc anyway.
+		if v.attachmentType == attachmentTypeTCX {
+			p.cleanTCX(v.tcxIngressLink, v.tcxEgressLink)
+		} else if v.tc != nil {
+			if err := v.tc.Close(); err != nil {
+				p.l.Warn("could not close stale rtnetlink socket", zap.Error(err))
+			}
+		}
+		p.attachmentMap.Delete(ifaceToKey(iface))
+	}
 	p.l.Debug("Starting attachment", zap.String("interface", iface.Name))
 
 	if p.tcxSupported {
@@ -642,7 +777,6 @@ func (p *packetParser) attachViaTC(iface netlink.LinkAttrs, ifaceType interfaceT
 	var (
 		ingressProgram, egressProgram *ebpf.Program
 		ingressInfo, egressInfo       *ebpf.ProgramInfo
-		err                           error
 	)
 
 	switch ifaceType {
@@ -668,8 +802,10 @@ func (p *packetParser) attachViaTC(iface netlink.LinkAttrs, ifaceType interfaceT
 		return
 	}
 	// set extended acknowledge option for more detailed error messages.
-	if err = rtnl.SetOption(nl.ExtendedAcknowledge, true); err != nil {
-		p.l.Warn("could not set extended acknowledge option", zap.Error(err))
+	// Non-fatal: must not feed the cleanup defer below (a poisoned err would tear
+	// down a successful attach), so keep its error local.
+	if optErr := rtnl.SetOption(nl.ExtendedAcknowledge, true); optErr != nil {
+		p.l.Warn("could not set extended acknowledge option", zap.Error(optErr))
 	}
 
 	// Create a qdisc of type clsact on the tunnel interface.
@@ -688,13 +824,32 @@ func (p *packetParser) attachViaTC(iface netlink.LinkAttrs, ifaceType interfaceT
 			Kind: "clsact",
 		},
 	}
+	// Release the socket and undo the qdisc on any failed exit. Keyed on explicit
+	// flags, not err: the failure returns below shadow err, so an err-keyed defer
+	// would never fire — leaking one rtnl fd per failed attach, once per refresh
+	// under the level-triggered re-assert. Delete only a qdisc we created — a
+	// pre-existing clsact may belong to another agent, and deleting it would tear
+	// down their filters too.
+	attached := false
+	createdQdisc := false
 	defer func() {
-		if err != nil {
-			p.clean(rtnl, clsactQdisc)
+		if attached {
+			return
+		}
+		if createdQdisc {
+			if err := getQdisc(rtnl).Delete(clsactQdisc); err != nil && !errors.Is(err, tc.ErrNoArg) {
+				p.l.Debug("could not delete clsact qdisc", zap.Error(err))
+			}
+		}
+		if err := rtnl.Close(); err != nil {
+			p.l.Warn("could not close rtnetlink socket", zap.Error(err))
 		}
 	}()
 	// Install Qdisc on interface.
-	if err := getQdisc(rtnl).Add(clsactQdisc); err != nil && !errors.Is(err, os.ErrExist) {
+	switch err := getQdisc(rtnl).Add(clsactQdisc); {
+	case err == nil:
+		createdQdisc = true
+	case !errors.Is(err, os.ErrExist):
 		p.l.Error("could not assign clsact to tunnel interface", zap.String("interface", iface.Name), zap.Error(err))
 		return
 	}
@@ -750,6 +905,7 @@ func (p *packetParser) attachViaTC(iface netlink.LinkAttrs, ifaceType interfaceT
 		tc:             rtnl,
 		qdisc:          clsactQdisc,
 	})
+	attached = true
 
 	p.l.Debug("Successfully attached BPF programs using traditional TC", zap.String("interface", iface.Name))
 }

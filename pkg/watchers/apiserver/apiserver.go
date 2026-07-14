@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/microsoft/retina/pkg/common"
 	cc "github.com/microsoft/retina/pkg/controllers/cache"
@@ -33,6 +34,7 @@ const (
 type ApiServerWatcher struct {
 	isRunning           bool
 	l                   *log.ZapLogger
+	mu                  sync.Mutex // guards current against concurrent snapshot reads
 	current             cache
 	new                 cache
 	apiServerHostName   string
@@ -102,9 +104,35 @@ func (a *ApiServerWatcher) Init(ctx context.Context) error {
 	}
 	a.apiServerHostName = hostName
 
+	// Register the snapshot source so a subscriber that joins after the watcher
+	// replays the current apiserver IP set immediately.
+	pubsub.New().RegisterSource(common.PubSubAPIServer, a.snapshot)
+
 	a.isRunning = true
 
 	return nil
+}
+
+// snapshot returns the current apiserver IPs as a single add event. Registered
+// as the pubsub source so late subscribers converge to the current set. It
+// applies the same IPv4 filter as Refresh's publishes: an IPv6 IP handed out
+// here would never be re-asserted nor deleted by the publish path, leaving the
+// subscriber with it forever.
+func (a *ApiServerWatcher) snapshot() []interface{} {
+	a.mu.Lock()
+	ips := make([]string, 0, len(a.current))
+	for k := range a.current {
+		if net.ParseIP(k).To4() == nil {
+			a.l.Warn("skipping non-IPv4 apiserver IP in snapshot", zap.String("ip", k))
+			continue
+		}
+		ips = append(ips, k)
+	}
+	a.mu.Unlock()
+	if len(ips) == 0 {
+		return nil
+	}
+	return []interface{}{cc.NewCacheEvent(cc.EventTypeAddAPIServerIPs, common.NewAPIServerObject(ips))}
 }
 
 // Stop stops the ApiServerWatcher.
@@ -124,42 +152,70 @@ func (a *ApiServerWatcher) Refresh(ctx context.Context) error {
 		return err
 	}
 
-	// Compare the new IPs with the old ones.
+	// created is only for operator-visible logging; adds are re-asserted from the
+	// full current set below. deleted drives removals.
 	created, deleted := a.diffCache()
-
-	createdIPs := []net.IP{}
-	deletedIPs := []net.IP{}
-
 	for _, v := range created {
-		a.l.Info("New Apiserver IPs:", zap.Any("ip", v))
-		ip := net.ParseIP(v.(string)).To4()
-		createdIPs = append(createdIPs, ip)
+		a.l.Info("New Apiserver IP", zap.Any("ip", v))
 	}
-
 	for _, v := range deleted {
-		a.l.Info("Deleted Apiserver IPs:", zap.Any("ip", v))
-		ip := net.ParseIP(v.(string)).To4()
-		deletedIPs = append(deletedIPs, ip)
+		a.l.Info("Deleted Apiserver IP", zap.Any("ip", v))
 	}
 
-	if len(createdIPs) > 0 {
-		a.publish(createdIPs, cc.EventTypeAddAPIServerIPs)
-		err := a.filterManager.AddIPs(createdIPs, "apiserver-watcher", fm.RequestMetadata{RuleID: "apiserver-watcher"})
-		if err != nil {
-			a.l.Error("Failed to add IPs to filter manager", zap.Error(err))
+	// currentIPs is the full live set (a.new); by construction it excludes
+	// anything in deleted (deleted = a.current - a.new). The filter map is
+	// IPv4-keyed, so skip anything To4 can't represent (e.g. IPv6 on dual-stack)
+	// — appending the nil would otherwise be re-asserted every refresh.
+	currentIPs := make([]net.IP, 0, len(a.new))
+	for k := range a.new {
+		if ip := net.ParseIP(k).To4(); ip != nil {
+			currentIPs = append(currentIPs, ip)
+		} else {
+			a.l.Warn("skipping non-IPv4 apiserver IP", zap.String("ip", k))
+		}
+	}
+	deletedIPs := make([]net.IP, 0, len(deleted))
+	for _, v := range deleted {
+		if ip := net.ParseIP(v.(string)).To4(); ip != nil {
+			deletedIPs = append(deletedIPs, ip)
+		} else {
+			a.l.Warn("skipping non-IPv4 apiserver IP", zap.String("ip", v.(string)))
 		}
 	}
 
+	// Commit current before publishing. snapshot() (served to new subscribers)
+	// reads a.current, so committing first ensures a subscriber joining during
+	// this refresh never sees a snapshot that still contains an IP whose delete we
+	// are about to publish — otherwise it would get the stale add via snapshot but
+	// miss the delete and keep the IP forever. currentIPs/deletedIPs are already
+	// captured above, so the publishes below are unaffected.
+	a.mu.Lock()
+	a.current = a.new.deepcopy()
+	a.mu.Unlock()
+	a.new = nil
+
+	// Publish deletes BEFORE the add re-assert. The cache keys all apiserver IPs
+	// under one endpoint (kubernetes-apiserver) and handles a delete by dropping
+	// the whole entry, so a delete published after the add would wipe the set
+	// just asserted and leave the cache without an apiserver endpoint until the
+	// next refresh. Delete-then-add converges immediately; the per-IP consumers
+	// are order-insensitive since the two sets are disjoint.
 	if len(deletedIPs) > 0 {
 		a.publish(deletedIPs, cc.EventTypeDeleteAPIServerIPs)
-		err := a.filterManager.DeleteIPs(deletedIPs, "apiserver-watcher", fm.RequestMetadata{RuleID: "apiserver-watcher"})
-		if err != nil {
+		if err := a.filterManager.DeleteIPs(deletedIPs, "apiserver-watcher", fm.RequestMetadata{RuleID: "apiserver-watcher"}); err != nil {
 			a.l.Error("Failed to delete IPs from filter manager", zap.Error(err))
 		}
 	}
 
-	a.current = a.new.deepcopy()
-	a.new = nil
+	// Re-assert all current IPs every refresh (level-triggered, idempotent):
+	// consumers self-heal a missed add regardless of subscribe timing, and this
+	// retries any filter-map add that previously failed.
+	if len(currentIPs) > 0 {
+		a.publish(currentIPs, cc.EventTypeAddAPIServerIPs)
+		if err := a.filterManager.AddIPs(currentIPs, "apiserver-watcher", fm.RequestMetadata{RuleID: "apiserver-watcher"}); err != nil {
+			a.l.Error("Failed to add IPs to filter manager", zap.Error(err))
+		}
+	}
 
 	return nil
 }

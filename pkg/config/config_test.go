@@ -30,7 +30,9 @@ func TestGetConfig(t *testing.T) {
 		c.TelemetryInterval != 15*time.Minute ||
 		c.DataAggregationLevel != Low ||
 		c.DataSamplingRate != 1 ||
-		c.PacketParserRingBuffer != PacketParserRingBufferDisabled {
+		c.PacketParserRingBuffer != PacketParserRingBufferDisabled ||
+		!c.EnableEndpointNetlinkEvents ||
+		c.WatcherRefreshInterval != 45*time.Second {
 		t.Errorf("Expeted config should be same as ./testwith/config.yaml; instead got %+v", c)
 	}
 }

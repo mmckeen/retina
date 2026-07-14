@@ -6,13 +6,16 @@
 package endpoint
 
 import (
-	"github.com/Microsoft/hcsshim/hcn"
+	"context"
 )
+
+// hooks has no OS-facing dependencies to inject on Windows.
+type hooks struct{} //nolint:unused // satisfies the shared EndpointWatcher.hooks field; no netlink on windows
+
+func (e *EndpointWatcher) subscribe(_ context.Context) {}
+
+func describeEndpoint(_ interface{}) string { return "" }
 
 func (e *EndpointWatcher) initNewCache() error {
 	return nil
-}
-
-func listVeths() ([]hcn.HostComputeEndpoint, error) {
-	return nil, nil
 }
