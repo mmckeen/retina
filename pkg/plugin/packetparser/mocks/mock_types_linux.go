@@ -12,10 +12,63 @@ package mocks
 import (
 	reflect "reflect"
 
+	link "github.com/cilium/ebpf/link"
 	tc "github.com/florianl/go-tc"
 	netlink "github.com/mdlayher/netlink"
 	gomock "go.uber.org/mock/gomock"
 )
+
+// MocktcxLink is a mock of tcxLink interface.
+type MocktcxLink struct {
+	ctrl     *gomock.Controller
+	recorder *MocktcxLinkMockRecorder
+}
+
+// MocktcxLinkMockRecorder is the mock recorder for MocktcxLink.
+type MocktcxLinkMockRecorder struct {
+	mock *MocktcxLink
+}
+
+// NewMocktcxLink creates a new mock instance.
+func NewMocktcxLink(ctrl *gomock.Controller) *MocktcxLink {
+	mock := &MocktcxLink{ctrl: ctrl}
+	mock.recorder = &MocktcxLinkMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MocktcxLink) EXPECT() *MocktcxLinkMockRecorder {
+	return m.recorder
+}
+
+// Close mocks base method.
+func (m *MocktcxLink) Close() error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Close")
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// Close indicates an expected call of Close.
+func (mr *MocktcxLinkMockRecorder) Close() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Close", reflect.TypeOf((*MocktcxLink)(nil).Close))
+}
+
+// Info mocks base method.
+func (m *MocktcxLink) Info() (*link.Info, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Info")
+	ret0, _ := ret[0].(*link.Info)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// Info indicates an expected call of Info.
+func (mr *MocktcxLinkMockRecorder) Info() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Info", reflect.TypeOf((*MocktcxLink)(nil).Info))
+}
 
 // Mockqdisc is a mock of qdisc interface.
 type Mockqdisc struct {
@@ -103,6 +156,21 @@ func (m *Mockfilter) Add(info *tc.Object) error {
 func (mr *MockfilterMockRecorder) Add(info any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Add", reflect.TypeOf((*Mockfilter)(nil).Add), info)
+}
+
+// Get mocks base method.
+func (m *Mockfilter) Get(info *tc.Msg) ([]tc.Object, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Get", info)
+	ret0, _ := ret[0].([]tc.Object)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// Get indicates an expected call of Get.
+func (mr *MockfilterMockRecorder) Get(info any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Get", reflect.TypeOf((*Mockfilter)(nil).Get), info)
 }
 
 // Mocknltc is a mock of nltc interface.
