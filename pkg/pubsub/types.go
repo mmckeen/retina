@@ -15,6 +15,8 @@ type PubSubInterface interface {
 	Subscribe(topic PubSubTopic, callback *CallBackFunc) string
 	// Unsubscribe unsubscribes from the given topic
 	Unsubscribe(topic PubSubTopic, uuid string) error
+	// RegisterSource registers a snapshot provider replayed to new subscribers
+	RegisterSource(topic PubSubTopic, snapshot func() []interface{})
 }
 
 type PubSubTopic string
