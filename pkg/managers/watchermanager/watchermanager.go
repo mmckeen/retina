@@ -19,13 +19,13 @@ const (
 	DefaultRefreshRate = 30 * time.Second
 )
 
-func NewWatcherManager(filterMapMaxEntries uint32, refreshRate time.Duration) *WatcherManager {
+func NewWatcherManager(filterMapMaxEntries uint32, enableEndpointNetlinkEvents bool, refreshRate time.Duration) *WatcherManager {
 	if refreshRate <= 0 {
 		refreshRate = DefaultRefreshRate
 	}
 	return &WatcherManager{
 		Watchers: []IWatcher{
-			endpoint.Watcher(),
+			endpoint.Watcher(enableEndpointNetlinkEvents),
 			apiserver.Watcher(filterMapMaxEntries),
 		},
 		l:           log.Logger().Named("watcher-manager"),

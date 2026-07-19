@@ -23,7 +23,7 @@ func TestStopWatcherManagerGracefully(t *testing.T) {
 	ctl := gomock.NewController(t)
 	defer ctl.Finish()
 	log.SetupZapLogger(log.GetDefaultLogOpts())
-	mgr := NewWatcherManager(kcfg.DefaultFilterMapMaxEntries, 0)
+	mgr := NewWatcherManager(kcfg.DefaultFilterMapMaxEntries, false, 0)
 
 	mockAPIServerWatcher := mock.NewMockIWatcher(ctl)
 	mockEndpointWatcher := mock.NewMockIWatcher(ctl)
@@ -63,7 +63,7 @@ func TestWatcherInitFailsGracefully(t *testing.T) {
 	mockAPIServerWatcher := mock.NewMockIWatcher(ctl)
 	mockEndpointWatcher := mock.NewMockIWatcher(ctl)
 
-	mgr := NewWatcherManager(kcfg.DefaultFilterMapMaxEntries, 0)
+	mgr := NewWatcherManager(kcfg.DefaultFilterMapMaxEntries, false, 0)
 	mgr.Watchers = []IWatcher{
 		mockAPIServerWatcher,
 		mockEndpointWatcher,
@@ -87,7 +87,7 @@ func TestStartUnwindsOnInitFailure(t *testing.T) {
 	first := mock.NewMockIWatcher(ctl)
 	second := mock.NewMockIWatcher(ctl)
 
-	mgr := NewWatcherManager(kcfg.DefaultFilterMapMaxEntries, 0)
+	mgr := NewWatcherManager(kcfg.DefaultFilterMapMaxEntries, false, 0)
 	mgr.Watchers = []IWatcher{first, second}
 
 	first.EXPECT().Init(gomock.Any()).Return(nil).Times(1)
@@ -115,7 +115,7 @@ func TestStopContinuesPastFailedWatcher(t *testing.T) {
 	failing := mock.NewMockIWatcher(ctl)
 	healthy := mock.NewMockIWatcher(ctl)
 
-	mgr := NewWatcherManager(kcfg.DefaultFilterMapMaxEntries, 0)
+	mgr := NewWatcherManager(kcfg.DefaultFilterMapMaxEntries, false, 0)
 	mgr.Watchers = []IWatcher{failing, healthy}
 
 	failing.EXPECT().Stop(gomock.Any()).Return(errInitFailed).Times(1)
@@ -133,7 +133,7 @@ func TestRunWatcherInitialReconcile(t *testing.T) {
 	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 
 	w := mock.NewMockIWatcher(ctl)
-	mgr := NewWatcherManager(kcfg.DefaultFilterMapMaxEntries, time.Hour) // no tick fires during the test
+	mgr := NewWatcherManager(kcfg.DefaultFilterMapMaxEntries, false, time.Hour) // no tick fires during the test
 	mgr.Watchers = []IWatcher{w}
 
 	refreshed := make(chan struct{}, 1)
@@ -163,7 +163,7 @@ func TestRunWatcherSurvivesRefreshErrors(t *testing.T) {
 	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 
 	w := mock.NewMockIWatcher(ctl)
-	mgr := NewWatcherManager(kcfg.DefaultFilterMapMaxEntries, 10*time.Millisecond)
+	mgr := NewWatcherManager(kcfg.DefaultFilterMapMaxEntries, false, 10*time.Millisecond)
 	mgr.Watchers = []IWatcher{w}
 
 	var calls atomic.Int32
@@ -185,7 +185,7 @@ func TestWatcherStopWithoutStart(t *testing.T) {
 	defer ctl.Finish()
 	log.SetupZapLogger(log.GetDefaultLogOpts())
 
-	mgr := NewWatcherManager(kcfg.DefaultFilterMapMaxEntries, 0)
+	mgr := NewWatcherManager(kcfg.DefaultFilterMapMaxEntries, false, 0)
 
 	err := mgr.Stop(context.Background())
 	require.Nil(t, err, "Expected no error when stopping watcher manager without starting it")

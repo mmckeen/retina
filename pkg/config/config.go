@@ -56,10 +56,10 @@ var (
 		"telemetryInterval smaller than %v is not allowed",
 		MinTelemetryInterval,
 	)
-	DefaultTelemetryInterval          = 15 * time.Minute
-	DefaultSamplingRate        uint32 = 1
-	DefaultFilterMapMaxEntries uint32 = 255
-	DefaultConntrackReportInterval    = 30 * time.Second
+	DefaultTelemetryInterval              = 15 * time.Minute
+	DefaultSamplingRate            uint32 = 1
+	DefaultFilterMapMaxEntries     uint32 = 255
+	DefaultConntrackReportInterval        = 30 * time.Second
 )
 
 func (l *Level) UnmarshalText(text []byte) error {
@@ -120,24 +120,25 @@ type Config struct {
 	EnabledPlugin   []string      `yaml:"enabledPlugin"`
 	MetricsInterval time.Duration `yaml:"metricsInterval"`
 	// Deprecated: Use only MetricsInterval instead in the go code.
-	MetricsIntervalDuration    time.Duration              `yaml:"metricsIntervalDuration"`
-	EnableTelemetry            bool                       `yaml:"enableTelemetry"`
-	EnableRetinaEndpoint       bool                       `yaml:"enableRetinaEndpoint"`
-	EnablePodLevel             bool                       `yaml:"enablePodLevel"`
-	EnableConntrackMetrics     bool                       `yaml:"enableConntrackMetrics"`
-	RemoteContext              bool                       `yaml:"remoteContext"`
-	EnableAnnotations          bool                       `yaml:"enableAnnotations"`
-	BypassLookupIPOfInterest   bool                       `yaml:"bypassLookupIPOfInterest"`
-	DataAggregationLevel       Level                      `yaml:"dataAggregationLevel"`
-	MonitorSockPath            string                     `yaml:"monitorSockPath"`
-	TelemetryInterval          time.Duration              `yaml:"telemetryInterval"`
-	DataSamplingRate           uint32                     `yaml:"dataSamplingRate"`
-	ConntrackReportInterval    time.Duration              `yaml:"conntrackReportInterval"`
-	PacketParserRingBuffer     PacketParserRingBufferMode `yaml:"packetParserRingBuffer"`
-	PacketParserRingBufferSize uint32                     `yaml:"packetParserRingBufferSize"`
-	FilterMapMaxEntries        uint32                     `yaml:"filterMapMaxEntries"`
-	EnableTCX                  TCXMode                    `yaml:"enableTCX"`
-	WatcherRefreshInterval     time.Duration              `yaml:"watcherRefreshInterval"`
+	MetricsIntervalDuration     time.Duration              `yaml:"metricsIntervalDuration"`
+	EnableTelemetry             bool                       `yaml:"enableTelemetry"`
+	EnableRetinaEndpoint        bool                       `yaml:"enableRetinaEndpoint"`
+	EnablePodLevel              bool                       `yaml:"enablePodLevel"`
+	EnableConntrackMetrics      bool                       `yaml:"enableConntrackMetrics"`
+	RemoteContext               bool                       `yaml:"remoteContext"`
+	EnableAnnotations           bool                       `yaml:"enableAnnotations"`
+	BypassLookupIPOfInterest    bool                       `yaml:"bypassLookupIPOfInterest"`
+	DataAggregationLevel        Level                      `yaml:"dataAggregationLevel"`
+	MonitorSockPath             string                     `yaml:"monitorSockPath"`
+	TelemetryInterval           time.Duration              `yaml:"telemetryInterval"`
+	DataSamplingRate            uint32                     `yaml:"dataSamplingRate"`
+	ConntrackReportInterval     time.Duration              `yaml:"conntrackReportInterval"`
+	PacketParserRingBuffer      PacketParserRingBufferMode `yaml:"packetParserRingBuffer"`
+	PacketParserRingBufferSize  uint32                     `yaml:"packetParserRingBufferSize"`
+	FilterMapMaxEntries         uint32                     `yaml:"filterMapMaxEntries"`
+	EnableTCX                   TCXMode                    `yaml:"enableTCX"`
+	EnableEndpointNetlinkEvents bool                       `yaml:"enableEndpointNetlinkEvents"`
+	WatcherRefreshInterval      time.Duration              `yaml:"watcherRefreshInterval"`
 }
 
 func GetConfig(cfgFilename string) (*Config, error) {

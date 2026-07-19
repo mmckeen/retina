@@ -12,3 +12,5 @@ dataAggregationLevel: "low"
 telemetryInterval: "15m"
 packetParserRingBuffer: "disabled"
 packetParserRingBufferSize: 8388608
+enableEndpointNetlinkEvents: true
+watcherRefreshInterval: "45s"
