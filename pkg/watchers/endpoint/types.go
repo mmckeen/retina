@@ -9,11 +9,11 @@ const (
 )
 
 type key struct {
-	name         string
-	hardwareAddr string
-	// Network namespace for linux.
-	// Compartment ID for windows.
-	netNsID int
+	// index is the interface index (linux) / compartment id (windows). It is the
+	// identifier the TCX/TC hook attaches with and is stable for the interface's
+	// lifetime, unlike name and NetNsID which change as a pod's veth is renamed
+	// and moved into its netns during init.
+	index int
 }
 
 type cache map[key]interface{}

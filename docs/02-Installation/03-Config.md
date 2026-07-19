@@ -57,6 +57,8 @@ Apply to both Agent and Operator.
 * `conntrackReportInterval`: Periodic interval (in `time.Duration`, default `30s`) at which conntrack reports active connections in high data aggregation mode. Values below `1s` fall back to the default. See [Report interval](../03-Metrics/plugins/Linux/packetparser.md#report-interval) for more details.
 * `packetParserRingBuffer`: Selects the kernel-to-userspace transport for `packetparser`. Accepted values: `enabled` (ring buffer) or `disabled` (perf event array). `auto` is reserved for future use.
 * `packetParserRingBufferSize`: Ring buffer size in bytes when `packetParserRingBuffer=enabled`. Must be a power of two between the kernel page size and 1GiB (inclusive); invalid values cause startup to fail.
+* `enableEndpointNetlinkEvents`: If true, the endpoint watcher subscribes to netlink link events and reconciles immediately when a veth appears or disappears, so eBPF programs attach within milliseconds of pod creation instead of waiting for the next periodic refresh. Default `false`. Linux only; the periodic refresh remains as a backstop.
+* `watcherRefreshInterval`: Interval (in `time.Duration`, default `30s`) at which the endpoint and API server watchers re-list and reconcile state. With `enableEndpointNetlinkEvents` this acts as a self-healing backstop rather than the primary attach path.
 
 ## Operator Configuration
 

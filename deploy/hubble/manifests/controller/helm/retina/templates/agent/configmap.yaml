@@ -117,6 +117,8 @@ data:
     monitorSockPath: {{ .Values.monitorSockPath }}
     packetParserRingBuffer: {{ .Values.packetParserRingBuffer }}
     packetParserRingBufferSize: {{ .Values.packetParserRingBufferSize }}
+    enableEndpointNetlinkEvents: {{ .Values.enableEndpointNetlinkEvents }}
+    watcherRefreshInterval: {{ .Values.watcherRefreshInterval }}
 {{- end}}
 ---
 {{- if .Values.os.windows}}

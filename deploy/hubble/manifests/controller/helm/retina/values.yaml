@@ -84,6 +84,10 @@ packetParserRingBuffer: "disabled"
 # Invalid values cause startup to fail with a validation error.
 # This value is not applied when ring buffers are disabled.
 packetParserRingBufferSize: 8388608
+# Attach eBPF programs on veth netlink events instead of waiting for the watcher refresh.
+enableEndpointNetlinkEvents: false
+# Watcher re-list interval.
+watcherRefreshInterval: "30s"
 
 imagePullSecrets: []
 nameOverride: "retina"
