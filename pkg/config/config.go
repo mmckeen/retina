@@ -137,6 +137,7 @@ type Config struct {
 	PacketParserRingBufferSize uint32                     `yaml:"packetParserRingBufferSize"`
 	FilterMapMaxEntries        uint32                     `yaml:"filterMapMaxEntries"`
 	EnableTCX                  TCXMode                    `yaml:"enableTCX"`
+	WatcherRefreshInterval     time.Duration              `yaml:"watcherRefreshInterval"`
 }
 
 func GetConfig(cfgFilename string) (*Config, error) {

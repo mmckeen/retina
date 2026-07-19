@@ -36,7 +36,7 @@ func main() {
 		}
 	}()
 	// watcher manager
-	wm := watchermanager.NewWatcherManager(kcfg.DefaultFilterMapMaxEntries)
+	wm := watchermanager.NewWatcherManager(kcfg.DefaultFilterMapMaxEntries, 0)
 	wm.Watchers = []watchermanager.IWatcher{apiserver.Watcher(kcfg.DefaultFilterMapMaxEntries)}
 
 	// apiserver watcher.
