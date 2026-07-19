@@ -5,6 +5,7 @@ package packetparser
 
 import (
 	"sync"
+	"sync/atomic"
 
 	kcfg "github.com/microsoft/retina/pkg/config"
 
@@ -77,9 +78,7 @@ var (
 
 // attachmentKey uniquely identifies a network interface for BPF program attachment.
 type attachmentKey struct {
-	name         string
-	hardwareAddr string
-	netNs        int
+	index int
 }
 
 // attachmentType represents the method used to attach BPF programs.
@@ -97,8 +96,16 @@ type attachmentValue struct {
 	qdisc *tc.Object
 	// TCX-specific fields
 	attachmentType attachmentType
-	tcxIngressLink link.Link
-	tcxEgressLink  link.Link
+	tcxIngressLink tcxLink
+	tcxEgressLink  tcxLink
+}
+
+// tcxLink is the subset of link.Link the parser needs. Narrower than link.Link
+// (whose unexported marker method blocks fakes) so tests can inject dead links
+// into the liveness check.
+type tcxLink interface {
+	Info() (*link.Info, error)
+	Close() error
 }
 
 //go:generate go run go.uber.org/mock/mockgen@v0.4.0 -source=types_linux.go -destination=mocks/mock_types_linux.go -package=mocks -exclude_interfaces=perfReader
@@ -112,6 +119,7 @@ type qdisc interface {
 // tc filter interface
 type filter interface {
 	Add(info *tc.Object) error
+	Get(info *tc.Msg) ([]tc.Object, error)
 }
 
 // netlink tc interface
@@ -153,12 +161,21 @@ type packetParser struct {
 	recordsChannel      chan perfRecord
 	externalChannel     chan *v1.Event
 	tcxSupported        bool // Whether TCX is supported on this system
+	// stopping and cbMu let Stop reach quiescence with the endpoint callback:
+	// pubsub's Unsubscribe does not wait for a delivery already in flight, so Stop
+	// sets stopping (new deliveries become no-ops), unsubscribes, then locks cbMu
+	// to wait out an in-flight callback before tearing down maps/programs.
+	stopping atomic.Bool
+	cbMu     sync.Mutex
 }
 
+// ifaceToKey keys on the interface index (the target of the TCX/TC attach),
+// which is stable for the interface's lifetime, unlike NetNsID/HardwareAddr,
+// which change as a pod's veth is moved into its netns during init — keying on
+// those caused the same interface to be seen under multiple keys and re-attached
+// ("already attached").
 func ifaceToKey(iface netlink.LinkAttrs) attachmentKey {
 	return attachmentKey{
-		name:         iface.Name,
-		hardwareAddr: iface.HardwareAddr.String(),
-		netNs:        iface.NetNsID,
+		index: iface.Index,
 	}
 }
