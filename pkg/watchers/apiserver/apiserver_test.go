@@ -9,12 +9,17 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"net"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/microsoft/retina/pkg/common"
 	kcfg "github.com/microsoft/retina/pkg/config"
+	cc "github.com/microsoft/retina/pkg/controllers/cache"
 	"github.com/microsoft/retina/pkg/log"
 	filtermanagermocks "github.com/microsoft/retina/pkg/managers/filtermanager"
+	"github.com/microsoft/retina/pkg/pubsub"
 	"github.com/microsoft/retina/pkg/watchers/apiserver/mocks"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -31,7 +36,7 @@ import (
 var errDNS = errors.New("DNS error")
 
 func TestGetWatcher(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 
 	a := Watcher(kcfg.DefaultFilterMapMaxEntries)
 	assert.NotNil(t, a)
@@ -41,7 +46,7 @@ func TestGetWatcher(t *testing.T) {
 }
 
 func TestAPIServerWatcherStop(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	ctrl := gomock.NewController(t)
@@ -71,7 +76,7 @@ func TestAPIServerWatcherStop(t *testing.T) {
 }
 
 func TestRefresh(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -100,8 +105,198 @@ func TestRefresh(t *testing.T) {
 	assert.NoError(t, a.Refresh(context.Background()), "Expected no error when refreshing the cache")
 }
 
+// TestRefreshSkipsNonIPv4 verifies IPv6 apiserver IPs (e.g. dual-stack) are
+// skipped rather than fed to the IPv4-keyed filter map as nils — which the
+// level-triggered re-assert would otherwise repeat every refresh.
+func TestRefreshSkipsNonIPv4(t *testing.T) {
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockedResolver := mocks.NewMockIHostResolver(ctrl)
+	mockedResolver.EXPECT().LookupHost(gomock.Any(), gomock.Any()).Return([]string{"10.9.9.9", "fd00::1"}, nil).AnyTimes()
+
+	var got []net.IP
+	mockedFilterManager := filtermanagermocks.NewMockIFilterManager(ctrl)
+	mockedFilterManager.EXPECT().AddIPs(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(ips []net.IP, _ filtermanagermocks.Requestor, _ filtermanagermocks.RequestMetadata) error {
+			got = ips
+			return nil
+		}).AnyTimes()
+	mockedFilterManager.EXPECT().DeleteIPs(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
+	a := &ApiServerWatcher{
+		l:             log.Logger().Named("apiserver-watcher"),
+		hostResolver:  mockedResolver,
+		filterManager: mockedFilterManager,
+		client:        getMockKubeClient(),
+	}
+
+	require.NoError(t, a.Refresh(context.Background()))
+
+	// 3 IPv4s from the mock kube client + 1 from the resolver; fd00::1 skipped.
+	assert.Len(t, got, 4, "expected only the IPv4 addresses")
+	for _, ip := range got {
+		assert.NotNil(t, ip, "no nil entries may reach the filter manager")
+	}
+}
+
+// TestSnapshot verifies the pubsub snapshot source returns the current apiserver
+// IP set as a single add event (and nothing when empty), so a late subscriber
+// converges to the current state.
+func TestSnapshot(t *testing.T) {
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
+
+	a := &ApiServerWatcher{
+		l:       log.Logger().Named("apiserver-watcher"),
+		current: cache{},
+	}
+	assert.Nil(t, a.snapshot(), "empty current should yield no snapshot events")
+
+	a.current = cache{"10.0.0.1": struct{}{}, "10.0.0.2": struct{}{}, "fd00::1": struct{}{}}
+	snap := a.snapshot()
+	require.Len(t, snap, 1, "snapshot should be a single add event carrying all current IPs")
+	ev, ok := snap[0].(*cc.CacheEvent)
+	require.True(t, ok, "snapshot item should be a *cache.CacheEvent")
+	assert.Equal(t, cc.EventTypeAddAPIServerIPs, ev.Type, "snapshot event should be an apiserver-IP add")
+	obj, ok := ev.Obj.(*common.APIServerObject)
+	require.True(t, ok, "snapshot event payload should be an *common.APIServerObject")
+	got := make([]string, 0, len(obj.IPs()))
+	for _, ip := range obj.IPs() {
+		got = append(got, ip.String())
+	}
+	assert.ElementsMatch(t, []string{"10.0.0.1", "10.0.0.2"}, got,
+		"snapshot must carry the IPv4 set and skip IPv6, matching the publish path's filter")
+
+	// All-IPv6 current: nothing publishable, so no snapshot event at all.
+	a.current = cache{"fd00::2": struct{}{}}
+	assert.Nil(t, a.snapshot(), "an all-IPv6 set should yield no snapshot events")
+}
+
+// TestRefreshPublishesDeleteBeforeAdd pins the publish order on an IP change.
+// The cache keys every apiserver IP under one endpoint and handles a delete by
+// dropping the whole entry, so a delete published after the add re-assert would
+// wipe the set just asserted and leave the cache without an apiserver endpoint
+// until the next refresh.
+func TestRefreshPublishesDeleteBeforeAdd(t *testing.T) {
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockedResolver := mocks.NewMockIHostResolver(ctrl)
+	gomock.InOrder(
+		mockedResolver.EXPECT().LookupHost(gomock.Any(), gomock.Any()).Return([]string{"10.0.0.1", "10.0.0.2"}, nil).Times(1),
+		mockedResolver.EXPECT().LookupHost(gomock.Any(), gomock.Any()).Return([]string{"10.0.0.1"}, nil).Times(1),
+	)
+	mockedFilterManager := filtermanagermocks.NewMockIFilterManager(ctrl)
+	mockedFilterManager.EXPECT().AddIPs(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	mockedFilterManager.EXPECT().DeleteIPs(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
+	a := &ApiServerWatcher{
+		l:             log.Logger().Named("apiserver-watcher"),
+		hostResolver:  mockedResolver,
+		filterManager: mockedFilterManager,
+		client:        getMockKubeClient(),
+		current:       cache{},
+	}
+
+	// Record the order of published event types on the apiserver topic.
+	var mu sync.Mutex
+	type published struct {
+		typ cc.EventType
+		ips []string
+	}
+	var events []published
+	fn := pubsub.CallBackFunc(func(msg interface{}) {
+		ev, ok := msg.(*cc.CacheEvent)
+		if !ok {
+			return
+		}
+		obj, ok := ev.Obj.(*common.APIServerObject)
+		if !ok || obj.EP == nil {
+			return
+		}
+		ips := []string{}
+		for _, ip := range obj.IPs() {
+			ips = append(ips, ip.String())
+		}
+		mu.Lock()
+		events = append(events, published{ev.Type, ips})
+		mu.Unlock()
+	})
+	ps := pubsub.New()
+	id := ps.Subscribe(common.PubSubAPIServer, &fn)
+	defer ps.Unsubscribe(common.PubSubAPIServer, id) //nolint:errcheck // best-effort cleanup in test
+
+	require.NoError(t, a.Refresh(context.Background()))
+	require.NoError(t, a.Refresh(context.Background())) // drops 10.0.0.2
+
+	assert.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		del := -1
+		for i, e := range events {
+			if e.typ == cc.EventTypeDeleteAPIServerIPs {
+				del = i
+				break
+			}
+		}
+		if del < 0 {
+			return false
+		}
+		assert.Equal(t, []string{"10.0.0.2"}, events[del].ips, "the delete must carry the dropped IP")
+		// The re-assert of the surviving set must come after the delete, so
+		// consumers that drop the whole entry on delete end converged.
+		for _, e := range events[del+1:] {
+			if e.typ == cc.EventTypeAddAPIServerIPs {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, 10*time.Millisecond,
+		"expected the delete to be published before the add re-assert")
+}
+
+// TestSnapshotConcurrentWithRefresh hammers snapshot() while Refresh commits —
+// under -race this pins the mutex protecting a.current, the only thing that
+// makes serving snapshots to arbitrary subscriber goroutines safe.
+func TestSnapshotConcurrentWithRefresh(t *testing.T) {
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockedResolver := mocks.NewMockIHostResolver(ctrl)
+	mockedResolver.EXPECT().LookupHost(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(context.Context, string) ([]string, error) {
+			return []string{randomIP(), randomIP()}, nil
+		}).AnyTimes()
+	mockedFilterManager := filtermanagermocks.NewMockIFilterManager(ctrl)
+	mockedFilterManager.EXPECT().AddIPs(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	mockedFilterManager.EXPECT().DeleteIPs(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
+	a := &ApiServerWatcher{
+		l:             log.Logger().Named("apiserver-watcher"),
+		hostResolver:  mockedResolver,
+		filterManager: mockedFilterManager,
+		client:        getMockKubeClient(),
+		current:       cache{},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 200 {
+			a.snapshot()
+		}
+	}()
+	for range 10 {
+		require.NoError(t, a.Refresh(context.Background()))
+	}
+	<-done
+}
+
 func TestDiffCache(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -128,7 +323,7 @@ func TestDiffCache(t *testing.T) {
 }
 
 func TestRefreshLookUpAlwaysFail(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -150,7 +345,7 @@ func TestRefreshLookUpAlwaysFail(t *testing.T) {
 }
 
 func TestInitWithIncorrectURL(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 

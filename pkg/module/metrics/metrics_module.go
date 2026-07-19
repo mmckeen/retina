@@ -537,10 +537,11 @@ func handlePodEvent(
 		m.dirtyPods.ToAdd(podCacheEntry.IP.String(), podCacheEntry)
 	case cache.EventTypePodDeleted:
 		// Guard against spurious DELETE events during pod churn / IP reuse.
-		// The cache (pkg/controllers/cache/cache.go) updates its maps synchronously
-		// (epMap/ipToEpKey) and then publishes events asynchronously via a goroutine.
-		// So when we process this DELETE, if a new pod already reused the IP, the
-		// cache will still contain a valid entry. Deleting would incorrectly remove it.
+		// The cache (pkg/controllers/cache/cache.go) commits its maps
+		// (epMap/ipToEpKey) before publishing, and delivery happens later on this
+		// subscriber's drain goroutine. So when we process this DELETE, if a new
+		// pod already reused the IP, the cache will still contain a valid entry.
+		// Deleting would incorrectly remove it.
 		if endpoint := m.daemonCache.GetPodByIP(ip.String()); endpoint != nil {
 			m.l.Debug("Ignoring DELETE for reused IP — pod still exists in cache",
 				zap.String("deleted pod", pod.NamespacedName()),
