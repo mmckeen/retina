@@ -466,8 +466,8 @@ test: # Run unit tests.
 	bash -o pipefail -c 'KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use -p path)" go test -tags=unit,dashboard -skip=TestE2E* -coverprofile=coverage.out -v -json ./... | ./test-summary --progress --verbose'
 
 .PHONY: test-ebpf
-test-ebpf: # Run eBPF program tests (requires root/CAP_BPF).
-	sudo $$(which go) test -tags=ebpf -v -count=1 ./pkg/plugin/...
+test-ebpf: # Run eBPF program tests (requires root/CAP_BPF; watcher tests need NET_ADMIN).
+	sudo $$(which go) test -tags=ebpf -v -count=1 ./pkg/plugin/... ./pkg/watchers/...
 
 coverage: # Code coverage.
 #	go generate ./... && go test -tags=unit -coverprofile=coverage.out.tmp ./...

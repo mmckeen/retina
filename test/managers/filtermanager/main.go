@@ -39,8 +39,8 @@ func main() {
 	ctx := context.Background()
 
 	// watcher manager
-	wm := watchermanager.NewWatcherManager(kcfg.DefaultFilterMapMaxEntries, 0)
-	wm.Watchers = []watchermanager.IWatcher{endpoint.Watcher(), apiserver.Watcher(kcfg.DefaultFilterMapMaxEntries)}
+	wm := watchermanager.NewWatcherManager(kcfg.DefaultFilterMapMaxEntries, false, 0)
+	wm.Watchers = []watchermanager.IWatcher{endpoint.Watcher(false), apiserver.Watcher(kcfg.DefaultFilterMapMaxEntries)}
 
 	err := wm.Start(ctx)
 	if err != nil {
