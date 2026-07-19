@@ -6,6 +6,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/microsoft/retina/pkg/common"
 	"github.com/microsoft/retina/pkg/log"
@@ -15,8 +16,94 @@ import (
 	gomock "go.uber.org/mock/gomock"
 )
 
+// TestCachePublishOrderingSameKey verifies that events for the same object are
+// delivered in the order they were produced. A prior implementation published
+// each event on its own goroutine, letting an add and a later delete of the same
+// key arrive reversed and leave consumers with a stale entry.
+func TestCachePublishOrderingSameKey(t *testing.T) {
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
+	p := pubsub.New()
+	c := New(p)
+
+	var mu sync.Mutex
+	var order []EventType
+	done := make(chan struct{}, 1)
+	cb := pubsub.CallBackFunc(func(msg interface{}) {
+		ev, ok := msg.(*CacheEvent)
+		if !ok {
+			return
+		}
+		mu.Lock()
+		order = append(order, ev.Type)
+		n := len(order)
+		mu.Unlock()
+		if n == 2 {
+			select {
+			case done <- struct{}{}:
+			default:
+			}
+		}
+	})
+	id := p.Subscribe(common.PubSubPods, &cb)
+	defer p.Unsubscribe(common.PubSubPods, id) //nolint:errcheck // best-effort cleanup in test
+
+	ep := common.NewRetinaEndpoint("pod-order", "ns1", nil)
+	ep.SetIPs(&common.IPAddresses{IPv4: net.IPv4(10, 0, 0, 9)})
+	require.NoError(t, c.UpdateRetinaEndpoint(ep))
+	require.NoError(t, c.DeleteRetinaEndpoint(ep.Key()))
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("did not receive both pod events")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []EventType{EventTypePodAdded, EventTypePodDeleted}, order,
+		"add must be delivered before delete for the same key")
+}
+
+// TestCacheSnapshotReplaysCurrentPod verifies the registered pod snapshot source
+// replays the current cache state to a subscriber that joins after the pod exists.
+func TestCacheSnapshotReplaysCurrentPod(t *testing.T) {
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
+	p := pubsub.New()
+	c := New(p)
+	// Explicit, as in the daemon: New must not register sources itself, or any
+	// incidental extra cache.New on the pubsub singleton (e.g. the controller
+	// manager's) would steal the topic's snapshot slot from the real cache.
+	c.RegisterSnapshotSources()
+
+	ep := common.NewRetinaEndpoint("pod-snap", "ns1", nil)
+	ep.SetIPs(&common.IPAddresses{IPv4: net.IPv4(10, 0, 0, 20)})
+	require.NoError(t, c.UpdateRetinaEndpoint(ep))
+
+	got := make(chan string, 1)
+	cb := pubsub.CallBackFunc(func(msg interface{}) {
+		ev, ok := msg.(*CacheEvent)
+		if !ok || ev.Type != EventTypePodAdded {
+			return
+		}
+		if rep, ok := ev.Obj.(*common.RetinaEndpoint); ok {
+			select {
+			case got <- rep.Name():
+			default:
+			}
+		}
+	})
+	id := p.Subscribe(common.PubSubPods, &cb)
+	defer p.Unsubscribe(common.PubSubPods, id) //nolint:errcheck // best-effort cleanup in test
+
+	select {
+	case name := <-got:
+		assert.Equal(t, "pod-snap", name, "late subscriber should receive the current pod via snapshot")
+	case <-time.After(2 * time.Second):
+		t.Fatal("late subscriber did not receive current pod via snapshot")
+	}
+}
+
 func TestNewCache(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	p := pubsub.NewMockPubSubInterface(ctrl)
@@ -26,7 +113,7 @@ func TestNewCache(t *testing.T) {
 }
 
 func TestCacheEndpoints(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	p := pubsub.NewMockPubSubInterface(ctrl)
@@ -97,7 +184,7 @@ func TestCacheEndpoints(t *testing.T) {
 }
 
 func TestCacheServices(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	p := pubsub.NewMockPubSubInterface(ctrl)
@@ -145,7 +232,7 @@ func TestCacheServices(t *testing.T) {
 }
 
 func TestCacheNodes(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	p := pubsub.NewMockPubSubInterface(ctrl)
@@ -182,7 +269,7 @@ func TestCacheNodes(t *testing.T) {
 }
 
 func TestAddPodSvcNodeSameIP(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	p := pubsub.NewMockPubSubInterface(ctrl)
@@ -237,7 +324,7 @@ func TestAddPodSvcNodeSameIP(t *testing.T) {
 }
 
 func TestAddPodSvcNodeSameIPDiffNS(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	p := pubsub.NewMockPubSubInterface(ctrl)
@@ -293,7 +380,7 @@ func TestAddPodSvcNodeSameIPDiffNS(t *testing.T) {
 }
 
 func TestAddPodDiffNs(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	p := pubsub.NewMockPubSubInterface(ctrl)
@@ -341,7 +428,7 @@ func TestAddPodDiffNs(t *testing.T) {
 }
 
 func TestFailDelete(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	p := pubsub.NewMockPubSubInterface(ctrl)
@@ -366,7 +453,7 @@ func TestFailDelete(t *testing.T) {
 }
 
 func TestCachingNamespace(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	_, _ = log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	p := pubsub.NewMockPubSubInterface(ctrl)

@@ -64,6 +64,53 @@ func New(p pubsub.PubSubInterface) *Cache {
 	return c
 }
 
+// RegisterSnapshotSources registers this cache as the pubsub snapshot provider
+// for pods, services and nodes, so a subscriber that joins after the cache is
+// populated (e.g. the metrics module, which subscribes on its first
+// MetricsConfig reconcile) replays the current state immediately. Called
+// explicitly on the cache the k8s controllers feed, NOT from New: pubsub is a
+// process singleton with one source slot per topic, so a second incidental
+// cache.New (the controller manager creates one) would otherwise silently
+// steal the slot and serve empty snapshots.
+func (c *Cache) RegisterSnapshotSources() {
+	c.pubsub.RegisterSource(common.PubSubPods, c.podSnapshot)
+	c.pubsub.RegisterSource(common.PubSubSvc, c.svcSnapshot)
+	c.pubsub.RegisterSource(common.PubSubNode, c.nodeSnapshot)
+}
+
+// podSnapshot returns the current pods as add events.
+func (c *Cache) podSnapshot() []interface{} {
+	c.RLock()
+	defer c.RUnlock()
+	events := make([]interface{}, 0, len(c.epMap))
+	for _, ep := range c.epMap {
+		events = append(events, NewCacheEvent(EventTypePodAdded, ep))
+	}
+	return events
+}
+
+// svcSnapshot returns the current services as add events.
+func (c *Cache) svcSnapshot() []interface{} {
+	c.RLock()
+	defer c.RUnlock()
+	events := make([]interface{}, 0, len(c.svcMap))
+	for _, svc := range c.svcMap {
+		events = append(events, NewCacheEvent(EventTypeSvcAdded, svc))
+	}
+	return events
+}
+
+// nodeSnapshot returns the current nodes as add events.
+func (c *Cache) nodeSnapshot() []interface{} {
+	c.RLock()
+	defer c.RUnlock()
+	events := make([]interface{}, 0, len(c.nodeMap))
+	for _, node := range c.nodeMap {
+		events = append(events, NewCacheEvent(EventTypeNodeAdded, node))
+	}
+	return events
+}
+
 // GetPodByIP returns the retina endpoint for the given IP.
 func (c *Cache) GetPodByIP(ip string) *common.RetinaEndpoint {
 	c.RLock()
@@ -448,9 +495,13 @@ func (c *Cache) publish(t EventType, obj common.PublishObj) {
 		topic = common.PubSubNode
 	}
 
-	go func() {
-		c.pubsub.Publish(topic, cev)
-	}()
+	// Publish synchronously so events for the same key keep their order: a prior
+	// dispatch-per-goroutine let an add and a later delete of the same object race
+	// and arrive reversed, leaving consumers with a stale/leaked entry. Publish
+	// only enqueues (callbacks run on subscriber goroutines), so this stays cheap
+	// under c's lock, and it cannot deadlock — Subscribe invokes snapshot sources
+	// outside the PubSub lock, so there is no PubSub-lock -> cache-lock ordering.
+	c.pubsub.Publish(topic, cev)
 }
 
 func (c *Cache) SubscribeAPIServerFn(obj interface{}) {
