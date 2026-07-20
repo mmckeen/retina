@@ -54,6 +54,11 @@ type packetparserCtEntry struct {
 	}
 }
 
+type packetparserCtGcMetrics struct {
+	Bytes   uint64
+	Packets uint64
+}
+
 type packetparserCtV4Key struct {
 	SrcIp   uint32
 	DstIp   uint32
@@ -162,6 +167,7 @@ type packetparserProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type packetparserMapSpecs struct {
 	RetinaConntrack          *ebpf.MapSpec `ebpf:"retina_conntrack"`
+	RetinaConntrackGcMetrics *ebpf.MapSpec `ebpf:"retina_conntrack_gc_metrics"`
 	RetinaFilter             *ebpf.MapSpec `ebpf:"retina_filter"`
 	RetinaPacketparserEvents *ebpf.MapSpec `ebpf:"retina_packetparser_events"`
 }
@@ -186,6 +192,7 @@ func (o *packetparserObjects) Close() error {
 // It can be passed to loadPacketparserObjects or ebpf.CollectionSpec.LoadAndAssign.
 type packetparserMaps struct {
 	RetinaConntrack          *ebpf.Map `ebpf:"retina_conntrack"`
+	RetinaConntrackGcMetrics *ebpf.Map `ebpf:"retina_conntrack_gc_metrics"`
 	RetinaFilter             *ebpf.Map `ebpf:"retina_filter"`
 	RetinaPacketparserEvents *ebpf.Map `ebpf:"retina_packetparser_events"`
 }
@@ -193,6 +200,7 @@ type packetparserMaps struct {
 func (m *packetparserMaps) Close() error {
 	return _PacketparserClose(
 		m.RetinaConntrack,
+		m.RetinaConntrackGcMetrics,
 		m.RetinaFilter,
 		m.RetinaPacketparserEvents,
 	)

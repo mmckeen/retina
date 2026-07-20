@@ -54,6 +54,11 @@ type conntrackCtEntry struct {
 	}
 }
 
+type conntrackCtGcMetrics struct {
+	Bytes   uint64
+	Packets uint64
+}
+
 type conntrackCtV4Key struct {
 	SrcIp   uint32
 	DstIp   uint32
@@ -110,7 +115,8 @@ type conntrackProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type conntrackMapSpecs struct {
-	RetinaConntrack *ebpf.MapSpec `ebpf:"retina_conntrack"`
+	RetinaConntrack          *ebpf.MapSpec `ebpf:"retina_conntrack"`
+	RetinaConntrackGcMetrics *ebpf.MapSpec `ebpf:"retina_conntrack_gc_metrics"`
 }
 
 // conntrackObjects contains all objects after they have been loaded into the kernel.
@@ -132,12 +138,14 @@ func (o *conntrackObjects) Close() error {
 //
 // It can be passed to loadConntrackObjects or ebpf.CollectionSpec.LoadAndAssign.
 type conntrackMaps struct {
-	RetinaConntrack *ebpf.Map `ebpf:"retina_conntrack"`
+	RetinaConntrack          *ebpf.Map `ebpf:"retina_conntrack"`
+	RetinaConntrackGcMetrics *ebpf.Map `ebpf:"retina_conntrack_gc_metrics"`
 }
 
 func (m *conntrackMaps) Close() error {
 	return _ConntrackClose(
 		m.RetinaConntrack,
+		m.RetinaConntrackGcMetrics,
 	)
 }
 

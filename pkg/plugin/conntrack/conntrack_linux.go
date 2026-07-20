@@ -27,7 +27,7 @@ import (
 
 var conntrackMetricsEnabled = false // conntrack metrics global variable
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go@master -cflags "-g -O2 -Wall -D__TARGET_ARCH_${GOARCH} -Wall" -target ${GOARCH} -type ct_v4_key conntrack ./_cprog/conntrack.c -- -I../lib/_${GOARCH} -I../lib/common/libbpf/_src -I../lib/common/libbpf/_include/linux -I../lib/common/libbpf/_include/uapi/linux -I../lib/common/libbpf/_include/asm
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go@master -cflags "-g -O2 -Wall -D__TARGET_ARCH_${GOARCH} -Wall" -target ${GOARCH} -type ct_v4_key -type ct_gc_metrics conntrack ./_cprog/conntrack.c -- -I../lib/_${GOARCH} -I../lib/common/libbpf/_src -I../lib/common/libbpf/_include/linux -I../lib/common/libbpf/_include/uapi/linux -I../lib/common/libbpf/_include/asm
 
 // Init initializes the conntrack eBPF map in the kernel for the first time.
 // This function should be called in the init container since
@@ -134,6 +134,53 @@ func gcEntryReason(proto uint8, value *conntrackCtEntry) string {
 	default:
 		return "other"
 	}
+}
+
+// gcUnreportedDirs are the host-relative directions that key
+// retina_conntrack_gc_metrics; the map value is a {bytes, packets} struct per key.
+var gcUnreportedDirs = [...]flow.TrafficDirection{
+	flow.TrafficDirection_TRAFFIC_DIRECTION_UNKNOWN,
+	flow.TrafficDirection_INGRESS,
+	flow.TrafficDirection_EGRESS,
+}
+
+// drainGCUnreported reads the eBPF gc-metrics map — bytes/packets observed since
+// the last report that were dropped when entries were deleted in-kernel
+// (RST/final-ACK/timeout), keyed by host-relative direction — and adds each
+// direction's per-cycle delta to the GC-unreported counters. The eBPF counters are
+// cumulative, so it tracks the last-seen value per direction and reports only the
+// increase. It returns an error on the first map read that fails (the entries share
+// one map handle, so the rest would fail the same way).
+func (ct *Conntrack) drainGCUnreported() error {
+	m := ct.objs.RetinaConntrackGcMetrics
+	if m == nil {
+		return nil
+	}
+	for i, dir := range gcUnreportedDirs {
+		label := utils.TrafficDirectionString(dir)
+		var perCPU []conntrackCtGcMetrics
+		if err := m.Lookup(dir, &perCPU); err != nil {
+			return errors.Wrapf(err, "reading conntrack gc metrics for %s direction", label)
+		}
+		var total conntrackCtGcMetrics
+		for cpu := range perCPU {
+			total.Bytes += perCPU[cpu].Bytes
+			total.Packets += perCPU[cpu].Packets
+		}
+
+		bytesAdd, bytesLast := plugincommon.CounterDelta(total.Bytes, ct.lastGCUnreported[i].Bytes)
+		ct.lastGCUnreported[i].Bytes = bytesLast
+		if bytesAdd > 0 {
+			metrics.ConntrackGCUnreportedBytesCounter.WithLabelValues(label).Add(float64(bytesAdd))
+		}
+
+		packetsAdd, packetsLast := plugincommon.CounterDelta(total.Packets, ct.lastGCUnreported[i].Packets)
+		ct.lastGCUnreported[i].Packets = packetsLast
+		if packetsAdd > 0 {
+			metrics.ConntrackGCUnreportedPacketsCounter.WithLabelValues(label).Add(float64(packetsAdd))
+		}
+	}
+	return nil
 }
 
 // Run starts the Conntrack garbage collection loop.
@@ -243,6 +290,12 @@ func (ct *Conntrack) Run(ctx context.Context) error {
 				metrics.ConntrackTotalConnections.WithLabelValues().Set(float64(totConnections))
 				metrics.ConntrackUnknownDirectionConnections.WithLabelValues().Set(float64(unknownDirectionEntries))
 				metrics.ConntrackUnknownDirectionBytes.WithLabelValues().Set(float64(unknownDirectionBytes))
+				// Residual dropped on in-kernel deletions (RST/final-ACK/timeout), recorded
+				// by the datapath in retina_conntrack_gc_metrics; complements the reap-loop
+				// measurement below, which only sees entries deleted from userspace.
+				if err := ct.drainGCUnreported(); err != nil {
+					ct.l.Error("failed to drain conntrack gc metrics", zap.Error(err))
+				}
 			}
 
 			// Delete the conntrack entries

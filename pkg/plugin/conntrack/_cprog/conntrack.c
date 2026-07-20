@@ -143,6 +143,26 @@ struct {
     __uint(pinning, LIBBPF_PIN_BY_NAME); // needs pinning so this can be access from other processes .i.e debug cli
 } retina_conntrack SEC(".maps");
 
+// ct_gc_metrics holds the bytes/packets observed since the last report that were
+// dropped when an entry was deleted in-kernel, for one host-relative direction.
+struct ct_gc_metrics {
+    __u64 bytes;
+    __u64 packets;
+};
+
+// retina_conntrack_gc_metrics accumulates the dropped residual keyed by host-relative
+// traffic direction (TRAFFIC_DIRECTION_*: 0 unknown, 1 ingress, 2 egress). The conntrack
+// GC loop drains it into the GC-unreported counters. Pinned by name so the packetparser
+// program (which inlines this file) writes it and the conntrack userspace GC loop reads
+// it, sharing one kernel map.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 3); // one per host-relative direction
+    __type(key, __u32);
+    __type(value, struct ct_gc_metrics);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} retina_conntrack_gc_metrics SEC(".maps");
+
 /**
  * Helper function to update the count of observed TCP flags.
  * @arg flags The observed flags.
@@ -421,6 +441,46 @@ static __always_inline struct packetreport _ct_handle_new_connection(struct pack
     return report;
 }
 
+/*
+ * Delete a conntrack entry. Before removing it, record the since-last-report
+ * residual for the direction the final report does not carry (the reply of the
+ * triggering packet's direction), attributed to its host-relative direction, so
+ * the loss is measured without flushing flows. tx aligns with the entry's
+ * traffic_direction; rx is the opposite. Routing every in-kernel deletion through
+ * here keeps any delete path from dropping the residual silently.
+ */
+static __always_inline void _ct_delete_entry(struct ct_v4_key *key, struct ct_entry *entry, __u8 direction) {
+    if (entry) {
+        __u8 td = entry->traffic_direction;
+        if (td > TRAFFIC_DIRECTION_EGRESS) {
+            td = TRAFFIC_DIRECTION_UNKNOWN;
+        }
+
+        __u32 lost_bytes, lost_packets, host_dir;
+        if (direction == CT_PACKET_DIR_TX) {
+            // Report carries tx (host dir == traffic_direction); the rx residual is lost.
+            lost_bytes = READ_ONCE(entry->bytes_seen_since_last_report_rx_dir);
+            lost_packets = READ_ONCE(entry->packets_seen_since_last_report_rx_dir);
+            host_dir = (td == TRAFFIC_DIRECTION_INGRESS) ? TRAFFIC_DIRECTION_EGRESS
+                     : (td == TRAFFIC_DIRECTION_EGRESS)  ? TRAFFIC_DIRECTION_INGRESS
+                                                         : TRAFFIC_DIRECTION_UNKNOWN;
+        } else {
+            // Report carries rx; the tx residual is lost (host dir == traffic_direction).
+            lost_bytes = READ_ONCE(entry->bytes_seen_since_last_report_tx_dir);
+            lost_packets = READ_ONCE(entry->packets_seen_since_last_report_tx_dir);
+            host_dir = td;
+        }
+        if (lost_bytes != 0 || lost_packets != 0) {
+            struct ct_gc_metrics *m = bpf_map_lookup_elem(&retina_conntrack_gc_metrics, &host_dir);
+            if (m) {
+                m->bytes += lost_bytes;
+                m->packets += lost_packets;
+            }
+        }
+    }
+    bpf_map_delete_elem(&retina_conntrack, key);
+}
+
 /**
  * Check if a packet should be reported to userspace. Update the corresponding conntrack entry.
  * @arg key The key of the connection in Retina's conntrack map.
@@ -477,7 +537,7 @@ static __always_inline struct packetreport _ct_should_report_packet(struct ct_v4
 
     // Check if the connection timed out
     if (now >= eviction_time) {
-        bpf_map_delete_elem(&retina_conntrack, key);
+        _ct_delete_entry(key, entry, direction);
         report.report = true;
         report.report_reason = REPORT_REASON_TIMEOUT;
         return report; // Report the last packet received before deletion
@@ -504,7 +564,7 @@ static __always_inline struct packetreport _ct_should_report_packet(struct ct_v4
             !(packet_flags & (TCP_FIN | TCP_SYN | TCP_RST)) &&
             (entry->flags_seen_tx_dir & TCP_FIN) &&
             (entry->flags_seen_rx_dir & TCP_FIN)) {
-            bpf_map_delete_elem(&retina_conntrack, key);
+            _ct_delete_entry(key, entry, direction);
             report.report = true;
             report.report_reason = REPORT_REASON_FINAL_ACK;
             return report; // Report final ACK before connection removal
@@ -512,7 +572,7 @@ static __always_inline struct packetreport _ct_should_report_packet(struct ct_v4
 
         // If RST is seen, delete connection immediately
         if (flags & TCP_RST) {
-            bpf_map_delete_elem(&retina_conntrack, key);
+            _ct_delete_entry(key, entry, direction);
             report.report = true;
             report.report_reason = REPORT_REASON_RST;
             return report; // Report RST before connection removal

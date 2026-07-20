@@ -20,6 +20,10 @@ type Conntrack struct {
 	objs        *conntrackObjects
 	ctMap       *ebpf.Map
 	gcFrequency time.Duration
+	// lastGCUnreported holds the last-seen cumulative bytes/packets per direction
+	// from the eBPF retina_conntrack_gc_metrics map, so each GC cycle adds only the
+	// delta to the GC-unreported counters. Indexed like gcUnreportedDirs.
+	lastGCUnreported [len(gcUnreportedDirs)]conntrackCtGcMetrics
 }
 
 // Define TCP flag constants
